@@ -17,8 +17,8 @@
 // @grant             GM_getValue
 // @grant             GM_addStyle
 // @license           MIT
-// @updateURL         https://raw.githubusercontent.com/dxdragon/UserScripts/master/M3U8%20AD%20Cleaner.meta.js
-// @downloadURL       https://raw.githubusercontent.com/dxdragon/UserScripts/master/M3U8%20AD%20Cleaner.user.js
+// @updateURL         https://raw.githubusercontent.com/dxdragon/UserScripts/main/M3U8%20AD%20Cleaner.meta.js
+// @downloadURL       https://raw.githubusercontent.com/dxdragon/UserScripts/main/M3U8%20AD%20Cleaner.user.js
 // ==/UserScript==
 
 (function () {

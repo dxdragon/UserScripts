@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         http://tampermonkey.net/
-// @version           1.0
+// @version           1.1
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -9,6 +9,10 @@
 // @exclude           *://*/recaptcha/*
 // @exclude           *://*.geetest.com/*
 // @exclude           *://*.hcaptcha.com/*
+// @exclude           *://live.*
+// @exclude           *://*/live/*
+// @exclude           *://*/live?*
+// @exclude           *://*/pclive/*
 // @run-at            document-start
 // @grant             unsafeWindow
 // @grant             GM_registerMenuCommand

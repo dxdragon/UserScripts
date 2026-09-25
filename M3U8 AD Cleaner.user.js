@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         http://tampermonkey.net/
-// @version           1.0
+// @version           1.1
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -9,6 +9,10 @@
 // @exclude           *://*/recaptcha/*
 // @exclude           *://*.geetest.com/*
 // @exclude           *://*.hcaptcha.com/*
+// @exclude           *://live.*
+// @exclude           *://*/live/*
+// @exclude           *://*/live?*
+// @exclude           *://*/pclive/*
 // @run-at            document-start
 // @grant             unsafeWindow
 // @grant             GM_registerMenuCommand
@@ -52,6 +56,8 @@
     // ============================================================
     const HOOKED_FLAGS = new WeakMap();
     const ATTACHED_VIDEOS = new WeakSet();
+    const URL_MAP = new WeakMap();        // ★ xhr -> request url
+    const RESP_CACHE = new WeakMap();     // ★ xhr -> filtered response string
 
     // ============================================================
     // 2. 常量
@@ -67,6 +73,7 @@
 
     const LOG_MAX = 400;
     const MAX_M3U8_LINES = 50000;
+    const MAX_M3U8_TEXT_LENGTH = 5 * 1024 * 1024;   // ★ 5MB 硬上限
 
     const INTEGER_TOLERANCE = 0.001;
 
@@ -79,7 +86,7 @@
     const TOAST_DELAY_NO_AD_MS = 500;
 
     const SHORT_AD_MAX_INTERVALS = 5;
-    const SHORT_AD_FRAGMENT_THRESHOLD = 3;   // 短区间超过上限时，只删片段数 ≤ 此值的区间
+    const SHORT_AD_FRAGMENT_THRESHOLD = 3;   // ★ 短区间超上限时，只删片段数 ≤ 此值
 
     const currentHost = unsafeWindow.location.hostname;
 
@@ -90,7 +97,7 @@
         {
             name: 'ryplay',
             test: /^(?:[-\w]+\.)*ryplay\d*\.com$/i,
-            strategies: ['short', 'integer'],   // ← 只改这里
+            strategies: ['short', 'integer'],
             options: {
                 integerRatioNum: 1,
                 integerRatioDen: 1,
@@ -151,15 +158,19 @@
         if (session.logs.length >= LOG_MAX) {
             session.logs.splice(0, session.logs.length - LOG_MAX + 50);
         }
-        session.logs.push({ rule, text: String(text) });
+        session.logs.push({ rule, text });
     }
 
+    // text 可为字符串或字符串数组；数组延迟到展示时才 join
     function logFilter(session, rule, text) {
-        console.log(
-            '%c[AD]',
-            'font-weight:bold;color:#fff;background:#70b566;padding:2px;border-radius:2px;',
-            rule, '\n' + text
-        );
+        if (DEBUG) {
+            const textStr = Array.isArray(text) ? text.join('\n') : text;
+            console.log(
+                '%c[AD]',
+                'font-weight:bold;color:#fff;background:#70b566;padding:2px;border-radius:2px;',
+                rule, '\n' + textStr
+            );
+        }
         logPush(session, rule, text);
         session.changed = true;
     }
@@ -336,7 +347,9 @@
                 const badge = isAdRule ? '<span class="ad-badge">[AD]</span>' : '';
                 parts.push(`<div class="rule">${badge}${escapeHtml(rule)}</div>`);
             }
-            parts.push(`<pre>${escapeHtml(entry.text)}</pre>`);
+            // ★ 延迟 join：log 里可能存的是数组
+            const textStr = Array.isArray(entry.text) ? entry.text.join('\n') : entry.text;
+            parts.push(`<pre>${escapeHtml(textStr)}</pre>`);
         }
         showModal(parts.join(''), '过滤日志');
     }
@@ -349,9 +362,16 @@
         return /\.m3u8($|[?#])/i.test(url);
     }
 
+    // ★ 宽松判断：URL 里出现 m3u8 即认为是 m3u8 请求（用于 hook 提前分流）
+    function looksLikeM3U8(url) {
+        if (!url || typeof url !== 'string') return false;
+        return url.indexOf('m3u8') !== -1;
+    }
+
+    // ★ 快速判断前 64 字节，避免全串扫描
     function isM3U8Content(text) {
         if (!text || typeof text !== 'string') return false;
-        return text.indexOf('#EXTM3U') > -1;
+        return text.slice(0, 64).indexOf('#EXTM3U') > -1;
     }
 
     function isBoundary(line) {
@@ -359,7 +379,7 @@
     }
 
     function isMediaSegment(line) {
-        if (!line || line.startsWith('#')) return false;
+        if (!line || line.charCodeAt(0) === 35 /* '#' */) return false;
         return /\.(ts|jpg|jpeg|png)($|[?#])/i.test(line);
     }
 
@@ -372,11 +392,11 @@
         return { num: parseInt(m[1], 10), len: extIdx };
     }
 
+    // ★ 去掉正则，改用 slice + parseFloat
     function parseExtinfDuration(line) {
+        if (!line || line.charCodeAt(0) !== 35) return null;
         if (!line.startsWith('#EXTINF')) return null;
-        const m = line.match(/#EXTINF:([\d.]+)/);
-        if (!m) return null;
-        const v = parseFloat(m[1]);
+        const v = parseFloat(line.slice(8));
         return isNaN(v) ? null : v;
     }
 
@@ -392,11 +412,17 @@
         try { return new URL(uri, baseUrl).href; } catch (e) { return uri; }
     }
 
+    // ★ 去掉两次 split，改用 indexOf + lastIndexOf
     function extractPathPrefix(uri) {
-        const clean = uri.split('?')[0].split('#')[0];
-        const idx = clean.lastIndexOf('/');
-        if (idx < 0) return '';
-        return clean.slice(0, idx + 1);
+        if (!uri) return '';
+        let end = uri.length;
+        const q = uri.indexOf('?');
+        if (q !== -1 && q < end) end = q;
+        const h = uri.indexOf('#');
+        if (h !== -1 && h < end) end = h;
+        if (end === 0) return '';
+        const idx = uri.lastIndexOf('/', end - 1);
+        return idx < 0 ? '' : uri.slice(0, idx + 1);
     }
 
     function getHostFromUrl(url) {
@@ -406,29 +432,6 @@
         } catch (e) {
             return '';
         }
-    }
-
-    // 清理冗余的 #EXT-X-DISCONTINUITY
-    // 规则：
-    // 1. 连续多个 #EXT-X-DISCONTINUITY，只保留第一个；
-    // 2. #EXT-X-DISCONTINUITY 后紧跟 #EXT-X-ENDLIST，删除该 #EXT-X-DISCONTINUITY。
-    function cleanupRedundantDiscontinuities(lines) {
-        const result = [];
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            if (line.startsWith('#EXT-X-DISCONTINUITY')) {
-                // 如果上一个保留的行也是 DISC，则跳过当前
-                if (result.length > 0 && result[result.length - 1].startsWith('#EXT-X-DISCONTINUITY')) {
-                    continue;
-                }
-                // 如果下一行是 ENDLIST，则跳过当前 DISC
-                if (i + 1 < lines.length && lines[i + 1].startsWith('#EXT-X-ENDLIST')) {
-                    continue;
-                }
-            }
-            result.push(line);
-        }
-        return result;
     }
 
     // ============================================================
@@ -555,8 +558,9 @@
         let hasKeyNone = false, hasAdjump = false;
         for (let i = 0, n = lines.length; i < n; i++) {
             const line = lines[i];
-            if (line === '#EXT-X-KEY:METHOD=NONE') { hasKeyNone = true; break; }
-            if (line.indexOf('/video/adjump/') !== -1) { hasAdjump = true; break; }
+            if (line === '#EXT-X-KEY:METHOD=NONE') hasKeyNone = true;
+            else if (line.indexOf('/video/adjump/') !== -1) hasAdjump = true;
+            if (hasKeyNone && hasAdjump) break;
         }
 
         if (hasKeyNone || hasAdjump) {
@@ -578,7 +582,6 @@
 
     // ============================================================
     // 12. 通用输出：按 del[] 的连续段分块
-    //     相邻广告自动合并，非相邻广告自然分块
     // ============================================================
     function emitDeletedBlocks(lines, del, reasonArr, session, defaultRule) {
         const n = lines.length;
@@ -602,11 +605,13 @@
                     ? '规则: ' + [...reasons].join(' + ')
                     : (defaultRule || '规则: 广告段');
 
-                const removed = lines.slice(start, i);
+                // ★ 日志里存数组，显示时才 join
+                const removed = [];
+                for (let k = start; k < i; k++) removed.push(lines[k]);
                 for (let k = 0; k < removed.length; k++) {
                     session.adLines.push(removed[k]);
                 }
-                logFilter(session, rule, removed.join('\n'));
+                logFilter(session, rule, removed);
             } else {
                 i++;
             }
@@ -623,7 +628,6 @@
 
     // ============================================================
     // 13. 处理器：FEATURE
-    //     先按规则标记内容行，最后统一按“相邻性”清理 DISC
     // ============================================================
     function markKeyNone(lines, del, reasonArr) {
         const n = lines.length;
@@ -665,7 +669,6 @@
                     }
                     break;
                 }
-                // 起始 DISC 交给后处理；内容行从 start+1 标起
                 for (let j = start + 1; j < i; j++) {
                     del[j] = 1;
                     reasonArr[j] = RULE_ADJ;
@@ -742,8 +745,6 @@
 
         if (!anyAd) return lines;
 
-        // 统一清理 DISCONTINUITY：只删与广告内容相邻的
-        // #EXT-X-ENDLIST 天然不参与
         for (let k = 0; k < n; k++) {
             if (!lines[k].startsWith('#EXT-X-DISCONTINUITY')) continue;
             if (del[k]) continue;
@@ -757,7 +758,6 @@
 
     // ============================================================
     // 14. 处理器：NUMERIC
-    //     先按数字递增异常标记内容行，最后统一清理 DISC
     // ============================================================
     function filterNumeric(lines, ctx, session) {
         const n = lines.length;
@@ -840,7 +840,6 @@
 
         if (!anyAd) return lines;
 
-        // 统一清理 DISCONTINUITY：只删与广告内容相邻的
         for (let k = 0; k < n; k++) {
             if (!lines[k].startsWith('#EXT-X-DISCONTINUITY')) continue;
             if (del[k]) continue;
@@ -865,11 +864,9 @@
         for (const it of intervals) {
             if (it.count === 0) continue;
 
-            // 整数片段占比 ≥ 1/3
             const countOK = it.integerCount * integerRatioDen >= it.count * integerRatioNum;
             if (!countOK) continue;
 
-            // 总时长为整数
             const totalOK = isIntegerDuration(it.totalDuration);
             if (!totalOK) continue;
 
@@ -888,7 +885,6 @@
             protectRatio = 0.2,
         } = options || {};
 
-        // 过滤掉空区间（count === 0），不参与任何统计与筛选
         const validIntervals = intervals.filter(it => it.count > 0);
 
         if (validIntervals.length === 0) {
@@ -960,7 +956,6 @@
 
     // ============================================================
     // 16. 主调度（SHORT 模式）
-    //     区间起点已包含起始 DISC，无需 DISC 后处理
     // ============================================================
     function filterIntervals(lines, m3u8Host, session) {
         const intervals = buildIntervals(lines);
@@ -991,8 +986,7 @@
             }
         }
 
-        // 短区间数量限制：
-        // 短区间广告超过 5 个时，只删除片段个数 ≤ 3 的短区间
+        // ★ 短区间数量限制：超过上限时，只删除片段数 ≤ SHORT_AD_FRAGMENT_THRESHOLD 的短区间
         if (shortIntervals.size > SHORT_AD_MAX_INTERVALS) {
             const kept = new Set();
             for (const it of shortIntervals) {
@@ -1030,40 +1024,60 @@
     // 17. 统一入口
     // ============================================================
     function processM3U8(text, url) {
-        if (!text || text.indexOf('#EXTM3U') === -1) {
+        // ★ 快速失败：只看前 64 字节 + 长度上限
+        if (!text || typeof text !== 'string' || text.slice(0, 64).indexOf('#EXTM3U') === -1) {
+            return { modified: text, changed: false, session: null, isMaster: false };
+        }
+        if (text.length > MAX_M3U8_TEXT_LENGTH) {
+            logError(`m3u8 文本超过 ${MAX_M3U8_TEXT_LENGTH} 字符，跳过过滤以保护性能`);
+            return { modified: text, changed: false, session: null, isMaster: false };
+        }
+
+        const rawLines = text.split('\n');
+        if (rawLines.length > MAX_M3U8_LINES) {
+            logError(`m3u8 行数超过 ${MAX_M3U8_LINES}，跳过过滤以保护性能`);
             return { modified: text, changed: false, session: null, isMaster: false };
         }
 
         const session = createSession(url || '');
 
-        let lines = text.split('\n');
-        if (lines.length > MAX_M3U8_LINES) {
-            logError(`m3u8 行数超过 ${MAX_M3U8_LINES}，跳过过滤以保护性能`);
-            return { modified: text, changed: false, session: null, isMaster: false };
-        }
-
-        // 清理冗余的 DISCONTINUITY，消除空区间
-        const originalLineCount = lines.length;
-        lines = cleanupRedundantDiscontinuities(lines);
-        const cleaned = lines.length !== originalLineCount;
-
-        // 统计媒体分片。无分片 → master playlist
+        // ★ 合并遍历：清理冗余 DISC + 统计 segmentCount + 收集 headLines
+        const lines = [];
+        const headLines = [];
         let segmentCount = 0;
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i].startsWith('#EXTINF')) {
-                const uri = lines[i + 1];
+        let inHead = true;
+
+        for (let i = 0; i < rawLines.length; i++) {
+            const line = rawLines[i];
+
+            // 清理冗余 DISC：
+            // 1) 连续多个 DISC 只保留第一个
+            // 2) DISC 后紧跟 ENDLIST 时删除该 DISC
+            if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+                if (lines.length > 0 && lines[lines.length - 1].startsWith('#EXT-X-DISCONTINUITY')) {
+                    continue;
+                }
+                if (i + 1 < rawLines.length && rawLines[i + 1].startsWith('#EXT-X-ENDLIST')) {
+                    continue;
+                }
+            }
+
+            if (line.startsWith('#EXTINF')) {
+                inHead = false;
+                const uri = rawLines[i + 1];
                 if (uri && isMediaSegment(uri)) segmentCount++;
             }
+
+            if (inHead) headLines.push(line);
+            lines.push(line);
         }
+
         if (segmentCount === 0) {
             if (DEBUG) logInfo('master playlist，跳过:', url);
             return { modified: text, changed: false, session: null, isMaster: true };
         }
 
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i].startsWith('#EXTINF')) break;
-            session.headLines.push(lines[i]);
-        }
+        session.headLines = headLines;
         if (session.headLines.length === 0 || session.headLines[0] !== '#EXTM3U') {
             session.headLines.unshift('#EXTM3U');
         }
@@ -1081,12 +1095,15 @@
             default:                     out = lines;
         }
 
-        // 如果没有广告过滤，但仍清理了冗余 DISC，则使用清理后的 lines
+        // ★ 无广告过滤，且没有清理 DISC 时，直接返回原文，避免一次 join
         const finalLines = session.changed ? out : lines;
+        if (!session.changed && lines.length === rawLines.length) {
+            session.filtered = text;
+            return { modified: text, changed: false, session, isMaster: false };
+        }
+
         const resultText = finalLines.join('\n');
         session.filtered = resultText;
-
-        // changed 仅表示是否过滤了广告片段
         return { modified: resultText, changed: session.changed, session, isMaster: false };
     }
 
@@ -1222,7 +1239,7 @@
     }
 
     // ============================================================
-    // 20. Hook: XHR
+    // 20. Hook: XHR（★ 非 m3u8 请求直接放行）
     // ============================================================
     const URL_SYM = Symbol('m3u8ar_url');
     const CACHE_SYM = Symbol('m3u8ar_cache');
@@ -1244,13 +1261,9 @@
 
         const openProxy = new Proxy(origOpen, {
             apply(target, thisArg, args) {
+                // ★ 只记录 URL，不在实例上写属性（避免改变隐藏类）
                 try {
-                    Object.defineProperty(thisArg, URL_SYM, {
-                        value: args[1],
-                        writable: true,
-                        enumerable: false,
-                        configurable: true
-                    });
+                    URL_MAP.set(thisArg, args[1] || '');
                 } catch (e) {}
                 return Reflect.apply(target, thisArg, args);
             }
@@ -1259,10 +1272,16 @@
         const sendProxy = new Proxy(origSend, {
             apply(target, thisArg, args) {
                 const xhr = thisArg;
+                const reqUrl = URL_MAP.get(xhr) || '';
+
+                // ★ 非 m3u8 请求直接放行，不做任何 hook
+                if (!looksLikeM3U8(reqUrl)) {
+                    return Reflect.apply(target, thisArg, args);
+                }
 
                 function getFiltered() {
-                    const cached = xhr[CACHE_SYM];
-                    if (cached) return cached.value;
+                    const cached = RESP_CACHE.get(xhr);
+                    if (cached !== undefined) return cached;
 
                     let original = '';
                     try {
@@ -1271,28 +1290,25 @@
                         original = '';
                     }
 
-                    if (!original || original.indexOf('#EXTM3U') === -1) {
-                        const c = { value: original };
-                        try { Object.defineProperty(xhr, CACHE_SYM, { value: c, configurable: true }); } catch (e) {}
+                    // ★ 只看前 64 字节
+                    if (!original || original.slice(0, 64).indexOf('#EXTM3U') === -1) {
+                        RESP_CACHE.set(xhr, original);
                         return original;
                     }
 
-                    const url = xhr.responseURL || xhr[URL_SYM] || '';
+                    const url = xhr.responseURL || reqUrl || '';
 
                     let result;
                     try {
                         result = processM3U8(original, url);
                     } catch (e) {
                         logError('处理失败:', e);
-                        const c = { value: original };
-                        try { Object.defineProperty(xhr, CACHE_SYM, { value: c, configurable: true }); } catch (e) {}
+                        RESP_CACHE.set(xhr, original);
                         return original;
                     }
 
                     onM3U8Processed(result, url);
-
-                    const c = { value: result.modified };
-                    try { Object.defineProperty(xhr, CACHE_SYM, { value: c, configurable: true }); } catch (e) {}
+                    RESP_CACHE.set(xhr, result.modified);
                     return result.modified;
                 }
 
@@ -1357,7 +1373,7 @@
     }
 
     // ============================================================
-    // 21. Hook: fetch
+    // 21. Hook: fetch（★ 非 m3u8 URL 不 clone 响应）
     // ============================================================
     function hookFetch() {
         const origFetch = unsafeWindow.fetch;
@@ -1367,19 +1383,17 @@
 
         const fetchProxy = new Proxy(origFetch, {
             apply(target, thisArg, args) {
+                // 同步提取 URL
+                let url = '';
+                if (typeof args[0] === 'string') url = args[0];
+                else if (args[0] && typeof args[0].url === 'string') url = args[0].url;
+
+                // ★ URL 不像 m3u8，直接放行，绝不 clone
+                if (!looksLikeM3U8(url)) {
+                    return Reflect.apply(target, thisArg, args);
+                }
+
                 return Reflect.apply(target, thisArg, args).then(function (response) {
-                    let url = '';
-                    if (typeof args[0] === 'string') url = args[0];
-                    else if (args[0] && args[0].url) url = args[0].url;
-                    else if (response.url) url = response.url;
-
-                    let needCheck = isM3U8File(url);
-                    if (!needCheck) {
-                        const ct = response.headers.get('content-type') || '';
-                        needCheck = /mpegurl/i.test(ct) || /m3u8/i.test(ct);
-                    }
-                    if (!needCheck) return response;
-
                     return response.clone().text().then(function (text) {
                         if (!isM3U8Content(text)) return response;
 
@@ -1387,13 +1401,13 @@
 
                         let result;
                         try {
-                            result = processM3U8(text, url || response.url);
+                            result = processM3U8(text, url);
                         } catch (e) {
                             logError('hookFetch 处理失败:', e);
                             return response;
                         }
 
-                        onM3U8Processed(result, url || response.url);
+                        onM3U8Processed(result, url);
                         if (!result.changed) return response;
 
                         const headers = new Headers(response.headers);
@@ -1563,12 +1577,15 @@
     }
 
     // ============================================================
-    // 24. 视频加载检测
+    // 24. 视频加载检测（★ MutationObserver 节流 + 找到即断开）
     // ============================================================
     function monitorVideo() {
         if (!shouldEnableHook()) return;
 
         let checkTimer = null;
+        let moTimer = null;
+        let observer = null;
+        let foundVideo = null;
 
         function scheduleCheck(video) {
             if (activeSession.url) return;
@@ -1598,22 +1615,42 @@
             }
         }
 
-        const existingVideo = unsafeWindow.document.querySelector('video');
-        if (existingVideo) attachVideo(existingVideo);
-
-        const observer = new MutationObserver(() => {
+        function tryAttach() {
+            if (foundVideo) return true;
             const video = unsafeWindow.document.querySelector('video');
-            if (video) attachVideo(video);
+            if (video) {
+                foundVideo = video;
+                attachVideo(video);
+                if (observer) {
+                    observer.disconnect();
+                    observer = null;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        if (tryAttach()) return;
+
+        // ★ 回调只做标志检查；querySelector 放到 300ms 节流里
+        observer = new MutationObserver(() => {
+            if (foundVideo || moTimer) return;
+            moTimer = setTimeout(() => {
+                moTimer = null;
+                tryAttach();
+            }, 300);
         });
 
+        const startObserve = () => {
+            if (!foundVideo && unsafeWindow.document.body) {
+                observer.observe(unsafeWindow.document.body, { childList: true, subtree: true });
+            }
+        };
+
         if (unsafeWindow.document.body) {
-            observer.observe(unsafeWindow.document.body, { childList: true, subtree: true });
+            startObserve();
         } else {
-            unsafeWindow.document.addEventListener('DOMContentLoaded', () => {
-                if (unsafeWindow.document.body) {
-                    observer.observe(unsafeWindow.document.body, { childList: true, subtree: true });
-                }
-            });
+            unsafeWindow.document.addEventListener('DOMContentLoaded', startObserve, { once: true });
         }
     }
 

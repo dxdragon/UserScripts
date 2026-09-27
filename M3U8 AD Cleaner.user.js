@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
-// @namespace         http://tampermonkey.net/
-// @version           1.1
+// @namespace         https://github.com/dxdragon/UserScripts
+// @version           1.2
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -50,6 +50,334 @@
         return false;
     }
     if (isVerificationPage()) return;
+    
+    // ============================================================
+    // 0.5 硬排除名单（无论全匹配 / 白名单模式，一律不启用）
+    //     匹配规则：host === 域名 或 host 以 ".域名" 结尾（覆盖所有子域）
+    //     列表项一律填「主域名」，如需精确到子域，填子域全称即可
+    // ============================================================
+    const HARD_EXCLUDE_GROUPS = {
+
+        // ================= 视频网站 =================
+
+        // ---- 国际主流 ----
+        videoIntl: [
+            'youtube.com', 'youtu.be', 'ytimg.com',
+            'netflix.com',
+            'hulu.com',
+            'disneyplus.com', 'disney-plus.net', 'bamgrid.com', 'dssott.com',
+            'hbomax.com', 'max.com',
+            'primevideo.com', 'amazonvideo.com',
+            'twitch.tv',
+            'vimeo.com', 'vhx.tv', 'vimeocdn.com',
+            'dailymotion.com', 'dmcdn.net',
+            'crunchyroll.com', 'funimation.com',
+            'peacocktv.com', 'paramountplus.com',
+            'tubitv.com', 'pluto.tv',
+            'viki.com',
+            'tv.apple.com',
+            'soundcloud.com', 'spotify.com',
+            'rumble.com', 'odysee.com',
+            'tiktok.com', 'tiktokv.com', 'tiktokcdn.com',
+            'facebook.com', 'fb.watch', 'fbcdn.net',
+            'reddit.com', 'redd.it', 'v.redd.it',
+            'x.com', 'twitter.com', 'twimg.com',
+        ],
+
+        // ---- 中国 ----
+        videoCn: [
+            'youku.com', 'tudou.com', 'ykimg.com',
+            'iqiyi.com', 'qiyi.com', 'iqiyipic.com', 'qy.net',
+            'v.qq.com',                              // 只排腾讯视频，不动 QQ 本体
+            'mgtv.com',
+            'bilibili.com', 'b23.tv', 'hdslb.com', 'bilivideo.com',
+            'sohu.com', 'sohucs.com',
+            'le.com', 'letv.com', 'letvimg.com',
+            'pptv.com', 'pplive.com',
+            'acfun.cn', 'acfun.com', 'acfun.tv',
+            'douyin.com', 'iesdouyin.com', 'douyincdn.com', 'douyinpic.com',
+            'kuaishou.com', 'kwaicdn.com', 'gifshow.com',
+            'ixigua.com',
+            '1905.com',
+            'cctv.com', 'cntv.cn', 'cctv.cn',
+            'music.163.com',
+            'weibo.com', 'weibo.cn', 'weibocdn.com', 'sinaimg.cn',
+            'miaopai.com',
+            'xiaohongshu.com', 'xhscdn.com',
+        ],
+
+        // ---- 日本 ----
+        videoJp: [
+            'nicovideo.jp', 'nimg.jp',
+            'abema.tv',
+            'tver.jp',
+            'dmm.com', 'dmm.co.jp',
+            'ameba.jp', 'ameblo.jp',
+        ],
+
+        // ---- 韩国 ----
+        videoKr: [
+            'vlive.tv',
+            'tv.naver.com', 'chzzk.naver.com',   // 只排 Naver 视频/直播，不动 Naver 搜索
+            'tv.kakao.com',
+        ],
+
+        // ---- 东南亚 / 印度 ----
+        videoSea: [
+            'viu.com', 'viu.tv',
+            'iflix.com',
+            'hotstar.com',
+            'jiocinema.com',
+            'sonyliv.com',
+            'zee5.com',
+            'voot.com',
+            'mxplayer.in', 'mxplayer.com',
+            'aha.video',
+            'loklok.com',
+        ],
+
+        // ---- 欧洲 ----
+        videoEu: [
+            'bbc.co.uk', 'bbc.com', 'bbci.co.uk',
+            'itv.com', 'itvstatic.com',
+            'channel4.com', 'c4assets.com',
+            'channel5.com', 'my5.tv',
+            'rte.ie',
+            'tf1.fr',
+            'francetv.fr', 'france.tv',
+            'm6.fr', 'm6web.fr',
+            'arte.tv',
+            'rtl.de', 'rtl2.de', 'vox.de',
+            'prosieben.de', 'sat1.de', 'kabel1.de',
+            'rai.it', 'raiplay.it', 'mediaset.it',
+            'tv3.cat', 'ccma.cat',
+            'rtve.es',
+            'nos.nl', 'npo.nl',
+            'svt.se', 'svtplay.se',
+            'tv4.se', 'tv4play.se',
+            'nrk.no', 'tv2.no', 'tv2.dk', 'dr.dk',
+            'yle.fi',
+            'ardmediathek.de', 'ard.de', 'zdf.de',
+        ],
+
+        // ---- 俄罗斯 / 独联体 ----
+        videoRu: [
+            'rutube.ru',
+            'ok.ru', 'odnoklassniki.ru',
+            'vk.com', 'vkvideo.ru', 'vk-cdn.net',
+            '1tv.ru', '1tv.com',
+            'my.mail.ru',
+            'kinopoisk.ru',
+            'ivi.ru',
+            'more.tv',
+            'wink.ru',
+            'start.ru',
+        ],
+
+        // ================= 直播网站 =================
+
+        // ---- 国际直播平台 ----
+        liveIntl: [
+            'kick.com',
+            'trovo.live',
+            'dlive.tv',
+            'bigo.tv', 'bigo.sg',
+            'live.me',
+            'younow.com',
+            'streamlabs.com',
+            'restream.io',
+            'lightstream.com',
+            'caffeine.tv',
+            'theta.tv', 'thetalive.net',
+            'streamable.com',
+            'livestream.com',
+            'ustream.tv',
+            'bambuser.com',
+            'boxcast.tv',
+            'dacast.com',
+        ],
+
+        // ---- 国际体育直播 ----
+        liveSports: [
+            'espn.com', 'espncdn.com', 'espn.co.uk',
+            'dazn.com',
+            'skysports.com', 'sky.com', 'skygo.com',
+            'beinsports.com', 'beinsports.net',
+            'eurosport.com', 'eurosport.co.uk',
+            'nba.com', 'nba.tv',
+            'nfl.com',
+            'mlb.com',
+            'nhl.com',
+            'fifa.com',
+            'uefa.com',
+            'premierleague.com',
+            'laliga.com',
+            'bundesliga.com',
+            'seriea.com',
+            'foxsports.com', 'foxsportsgo.com',
+            'cbssports.com', 'cbsivideo.com',
+            'nbcsports.com',
+            'bleacherreport.com',
+            'flosports.com',
+            'fubotv.com',
+            'sling.com',
+            'youtubetv.com',
+            'atresplayer.com',
+            'movistarplus.es',
+            'shahid.net',
+            'starzplay.com',
+            'osn.com',
+            'wavo.tv',
+            'globoplay.globo.com', 'globo.com',
+            'canalplus-afrique.com',
+            'dstv.com', 'multichoice.com',
+            'claro.com.br',
+        ],
+
+        // ---- 中国直播平台 ----
+        liveCn: [
+            'douyu.com', 'douyucdn.cn', 'douyucdn2.cn',
+            'huya.com', 'huyacdn.com', 'huya.com.cn',
+            'longzhu.com', 'plu.cn',
+            'quanmin.tv', 'qmcdn.com',
+            'zhanqi.tv',
+            'yy.com',
+            'cc.163.com',                    // 网易 CC，不动 163 邮箱
+            'live.qq.com', 'now.qq.com',     // 腾讯直播，不动 QQ 本体
+            'live.baidu.com', 'haokan.baidu.com',   // 百度直播，不动百度搜索
+            'huajiao.com',
+            'laifeng.com',
+            '6.cn',
+            '17.com',
+            'yizhibo.com',
+            'inke.cn', 'inke.tv',
+            'qiqi.com',
+            'taobao.com', 'tmall.com', 'tbcdn.cn',
+            'jd.com',
+            'live.kuaishou.com',             // kuaishou.com 已在 videoCn，这行是冗余保险
+        ],
+
+        // ---- 日本直播 ----
+        liveJp: [
+            'showroom-live.com',
+            'mirrativ.com',
+            'openrec.tv',
+            'twitcasting.tv',
+            '17.live', '17.media',
+            'pococha.com',
+            'linelive.com', 'line-scdn.net',
+        ],
+
+        // ---- 韩国直播 ----
+        liveKr: [
+            'afreecatv.com',
+            'pandatv.com',
+            'kakao.com', 'kakaocdn.net',
+        ],
+
+        // ---- 东南亚直播 ----
+        liveSea: [
+            'nonolive.com',
+            'booyah.live', 'booyahtv.com',
+        ],
+
+        // ================= CDN =================
+
+        // ---- 平台自有 CDN（服务面窄，误伤概率低，建议全开） ----
+        cdnOwned: [
+            // Google / YouTube
+            'googlevideo.com', 'ggpht.com',
+            // Netflix
+            'nflxvideo.net', 'nflximg.net', 'nflxext.com', 'nflxso.net',
+            // Twitch
+            'ttvnw.net', 'jtvnw.net', 'twitchcdn.net',
+            // Disney+ / Hulu / ESPN
+            'dssott.com', 'bamgrid.com', 'disney-plus.net',
+            // Amazon Prime
+            'aiv-cdn.net', 'aiv-delivery.net', 'pv-cdn.net',
+            // Bilibili
+            'hdslb.com', 'bilivideo.com', 'bilivideo.cn',
+            // TikTok / 抖音
+            'tiktokcdn.com', 'tiktokv.com', 'byteoversea.com', 'bytedance.com',
+            'douyincdn.com', 'douyinpic.com', 'douyinvod.com',
+            // 快手
+            'kwaicdn.com', 'gifshow.com',
+            // 优酷 / 爱奇艺
+            'ykimg.com', 'iqiyipic.com', 'qy.net',
+            // 微博
+            'weibocdn.com', 'sinaimg.cn',
+            // 通用播放器 / 流媒体服务
+            'mux.com', 'litix.io',
+            'jwplayer.com', 'jwpltx.com',
+            'brightcove.com', 'brightcove.net',
+            'wowza.com',
+        ],
+
+        // ---- 公共 CDN（服务面广，误伤概率高，可按需删减） ----
+        cdnPublic: [
+            // Akamai
+            'akamaihd.net', 'akamaized.net', 'akamai.com',
+            // Limelight / Level3 / Edgecast
+            'llnwd.net', 'limelight.com',
+            'level3.net',
+            'edgecastcdn.net',
+            // Fastly
+            'fastly.net', 'fastlylb.net',
+            // AWS CloudFront
+            'cloudfront.net',
+            // Azure
+            'azureedge.net', 'azurefd.net', 'msecnd.net',
+            // Cloudflare Stream
+            'cloudflarestream.com', 'cloudflarestream.net',
+            // 其它国际 CDN
+            'cachefly.net',
+            'cdn77.org', 'cdn77.com',
+            'stackpathdns.com', 'stackpath.com',
+            'hwcdn.net', 'highwinds.com',
+            'cdnetworks.net', 'cdngc.net',
+            'bunnycdn.com', 'b-cdn.net',
+            'keycdn.com',
+            'gcorelabs.com', 'gcdn.co',
+            // 国内公共云 CDN
+            'aliyuncs.com', 'alicdn.com',
+            'myqcloud.com', 'qcloudcdn.com',
+            'baidubce.com',
+            'huaweicloud.com', 'hwclouds.com',
+            'ksyun.com', 'ksyuncdn.com',
+            'chinacache.com', 'ccgslb.com',
+            'wscloudcdn.com', 'wsdvs.com', 'wscdns.com',
+        ],
+    };
+
+    // 扁平化 + 去重
+    const HARD_EXCLUDE_HOSTS = (() => {
+        const out = [];
+        const seen = new Set();
+        for (const k in HARD_EXCLUDE_GROUPS) {
+            const arr = HARD_EXCLUDE_GROUPS[k];
+            for (let i = 0; i < arr.length; i++) {
+                const v = String(arr[i]).toLowerCase();
+                if (!seen.has(v)) { seen.add(v); out.push(v); }
+            }
+        }
+        return out;
+    })();
+
+    // 匹配：host === 域名 或 host 以 ".域名" 结尾
+    function isHardExcludedHost(host) {
+        if (!host) return false;
+        const h = host.toLowerCase();
+        for (let i = 0; i < HARD_EXCLUDE_HOSTS.length; i++) {
+            const d = HARD_EXCLUDE_HOSTS[i];
+            if (h === d || h.endsWith('.' + d)) return true;
+        }
+        return false;
+    }
+
+    if (isHardExcludedHost(unsafeWindow.location.hostname)) {
+        console.log('[AD] 当前站点在硬排除名单中，脚本不启用:', unsafeWindow.location.hostname);
+        return;
+    }
 
     // ============================================================
     // 1. 弱引用标记

@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         B站链接净化
-// @namespace
+// @namespace    https://github.com/dxdragon/UserScripts
 // @version      1.0
 // @description  白名单模式净化B站链接：只保留列表中的参数，其余全部删除。支持自定义、批量添加和重置。
 // @author       Shay
@@ -14,8 +14,8 @@
 // @grant        unsafeWindow
 // @run-at       document-start
 // @license      MIT
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/bilibili_pure_link.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/bilibili_pure_link.user.js
+// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/bilibili_clean_link.user.js
+// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/bilibili_clean_link.user.js
 // ==/UserScript==
 
 (function () {

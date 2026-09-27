@@ -1,21 +1,21 @@
 // ==UserScript==
 // @name         搜索引擎双列
-// @namespace    local
+// @namespace    https://github.com/dxdragon/UserScripts
 // @version      1.0
 // @description  去广告 + 双列卡片（响应式）
-// @author       local
+// @author       Shay
 // @run-at       document-start
 // @include      *://www.baidu.com/*
 // @include      *://m.baidu.com/*
 // @include      *://*.bing.com/*
 // @include      *://*.google*/search*
 // @include      *://www.so.com/s?*
-// @include      *://*.duckduckgo.com/*
+// @include      *://duckduckgo.com/*
 // @include      *://*.startpage.com/*
 // @include      *://search.brave.com/*
 // @grant        GM_addStyle
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/searchengine_two_column.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/searchengine_two_column.user.js
+// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/searchengine_dual_column.user.js
+// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/searchengine_dual_column.user.js
 // ==/UserScript==
 
 (() => {

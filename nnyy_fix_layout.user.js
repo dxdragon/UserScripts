@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         努努影院修复首页布局
-// @namespace    Violentmonkey Scripts
+// @namespace    https://github.com/dxdragon/UserScripts
 // @version      1.0
 // @description  外层固定高度，白卡内部滚动；滚动条边界严格等于白卡边界
 // @author       Shay

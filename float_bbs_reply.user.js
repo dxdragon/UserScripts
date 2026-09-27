@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        论坛悬浮回复框
 // @description 常用论坛的悬浮回复框，点击固定，再次点击缩回
-// @namespace
+// @namespace   https://github.com/dxdragon/UserScripts
 // @author       Shay
 // @match       *://*/*thread*
 // @match       *://*/*forum*

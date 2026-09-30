@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.2
+// @version           1.3
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -50,7 +50,7 @@
         return false;
     }
     if (isVerificationPage()) return;
-    
+
     // ============================================================
     // 0.5 硬排除名单（无论全匹配 / 白名单模式，一律不启用）
     //     匹配规则：host === 域名 或 host 以 ".域名" 结尾（覆盖所有子域）
@@ -384,8 +384,16 @@
     // ============================================================
     const HOOKED_FLAGS = new WeakMap();
     const ATTACHED_VIDEOS = new WeakSet();
-    const URL_MAP = new WeakMap();        // ★ xhr -> request url
-    const RESP_CACHE = new WeakMap();     // ★ xhr -> filtered response string
+    const URL_MAP = new WeakMap();
+    const RESP_CACHE = new WeakMap();
+
+    // ============================================================
+    // 1.5 URI 目标匹配（key / map 相对路径补全）
+    // ============================================================
+    let pendingUriTargets = new Set();
+    const uriHits = new Map();
+    let requestRecordEnabled = false;
+    let uriTargetTimer = null;
 
     // ============================================================
     // 2. 常量
@@ -401,7 +409,7 @@
 
     const LOG_MAX = 400;
     const MAX_M3U8_LINES = 50000;
-    const MAX_M3U8_TEXT_LENGTH = 5 * 1024 * 1024;   // ★ 5MB 硬上限
+    const MAX_M3U8_TEXT_LENGTH = 5 * 1024 * 1024;
 
     const INTEGER_TOLERANCE = 0.001;
 
@@ -414,7 +422,9 @@
     const TOAST_DELAY_NO_AD_MS = 500;
 
     const SHORT_AD_MAX_INTERVALS = 5;
-    const SHORT_AD_FRAGMENT_THRESHOLD = 3;   // ★ 短区间超上限时，只删片段数 ≤ 此值
+    const SHORT_AD_FRAGMENT_THRESHOLD = 3;
+
+    const URI_TARGET_TIMEOUT_MS = 30000;
 
     const currentHost = unsafeWindow.location.hostname;
 
@@ -426,10 +436,7 @@
             name: 'ryplay',
             test: /^(?:[-\w]+\.)*ryplay\d*\.com$/i,
             strategies: ['short', 'integer'],
-            options: {
-                integerRatioNum: 1,
-                integerRatioDen: 1,
-            }
+            options: { integerRatioNum: 1, integerRatioDen: 1 }
         },
         {
             name: 'default',
@@ -489,7 +496,6 @@
         session.logs.push({ rule, text });
     }
 
-    // text 可为字符串或字符串数组；数组延迟到展示时才 join
     function logFilter(session, rule, text) {
         if (DEBUG) {
             const textStr = Array.isArray(text) ? text.join('\n') : text;
@@ -675,7 +681,6 @@
                 const badge = isAdRule ? '<span class="ad-badge">[AD]</span>' : '';
                 parts.push(`<div class="rule">${badge}${escapeHtml(rule)}</div>`);
             }
-            // ★ 延迟 join：log 里可能存的是数组
             const textStr = Array.isArray(entry.text) ? entry.text.join('\n') : entry.text;
             parts.push(`<pre>${escapeHtml(textStr)}</pre>`);
         }
@@ -690,13 +695,11 @@
         return /\.m3u8($|[?#])/i.test(url);
     }
 
-    // ★ 宽松判断：URL 里出现 m3u8 即认为是 m3u8 请求（用于 hook 提前分流）
     function looksLikeM3U8(url) {
         if (!url || typeof url !== 'string') return false;
         return url.indexOf('m3u8') !== -1;
     }
 
-    // ★ 快速判断前 64 字节，避免全串扫描
     function isM3U8Content(text) {
         if (!text || typeof text !== 'string') return false;
         return text.slice(0, 64).indexOf('#EXTM3U') > -1;
@@ -707,7 +710,7 @@
     }
 
     function isMediaSegment(line) {
-        if (!line || line.charCodeAt(0) === 35 /* '#' */) return false;
+        if (!line || line.charCodeAt(0) === 35) return false;
         return /\.(ts|jpg|jpeg|png)($|[?#])/i.test(line);
     }
 
@@ -720,7 +723,6 @@
         return { num: parseInt(m[1], 10), len: extIdx };
     }
 
-    // ★ 去掉正则，改用 slice + parseFloat
     function parseExtinfDuration(line) {
         if (!line || line.charCodeAt(0) !== 35) return null;
         if (!line.startsWith('#EXTINF')) return null;
@@ -740,7 +742,6 @@
         try { return new URL(uri, baseUrl).href; } catch (e) { return uri; }
     }
 
-    // ★ 去掉两次 split，改用 indexOf + lastIndexOf
     function extractPathPrefix(uri) {
         if (!uri) return '';
         let end = uri.length;
@@ -760,6 +761,122 @@
         } catch (e) {
             return '';
         }
+    }
+
+    // ============================================================
+    // 7.1 URI 匹配工具
+    // ============================================================
+    function stripQuery(url) {
+        if (!url) return url;
+        const q = url.indexOf('?');
+        return q === -1 ? url : url.slice(0, q);
+    }
+
+    function stripRelativePrefix(uri) {
+        return uri.replace(/^(?:\.\.?\/)+/, '');
+    }
+
+    function extractUriTargets(lines) {
+        const targets = new Set();
+        for (let i = 0, n = lines.length; i < n; i++) {
+            const line = lines[i];
+            if (!line.startsWith('#EXT-X-KEY') && !line.startsWith('#EXT-X-MAP')) continue;
+
+            const m = /URI="([^"]*)"/.exec(line);
+            if (m && m[1]) {
+                const uri = m[1];
+                if (!/^(https?:|data:|blob:|skd:)/i.test(uri)) {
+                    targets.add(uri);
+                }
+            }
+        }
+        return targets;
+    }
+
+    function notifyTopUriHit(target, url) {
+        if (unsafeWindow.self === unsafeWindow.top) return;
+        try {
+            unsafeWindow.top.postMessage({
+                __m3u8ar: true,
+                type: 'uriHit',
+                target,
+                url
+            }, '*');
+        } catch (e) {}
+    }
+
+    function notifyTopResetUriHits() {
+        if (unsafeWindow.self === unsafeWindow.top) return;
+        try {
+            unsafeWindow.top.postMessage({
+                __m3u8ar: true,
+                type: 'resetUriHits'
+            }, '*');
+        } catch (e) {}
+    }
+
+    function recordRequestUrl(url) {
+        if (!requestRecordEnabled) return;
+        if (!url || typeof url !== 'string') return;
+        if (pendingUriTargets.size === 0) {
+            requestRecordEnabled = false;
+            return;
+        }
+
+        const reqNoQuery = stripQuery(url);
+
+        // 1. 精确匹配
+        for (const target of pendingUriTargets) {
+            const stripped = stripRelativePrefix(target);
+            if (reqNoQuery === stripped) {
+                uriHits.set(target, url);
+                pendingUriTargets.delete(target);
+                notifyTopUriHit(target, url);
+                if (pendingUriTargets.size === 0) requestRecordEnabled = false;
+                return;
+            }
+        }
+
+        // 2. 后缀匹配，取最长
+        let best = null;
+        for (const target of pendingUriTargets) {
+            const stripped = stripRelativePrefix(target);
+            if (reqNoQuery.endsWith('/' + stripped)) {
+                if (!best || stripped.length > best.stripped.length) {
+                    best = { target, url, stripped };
+                }
+            }
+        }
+        if (best) {
+            uriHits.set(best.target, best.url);
+            pendingUriTargets.delete(best.target);
+            notifyTopUriHit(best.target, best.url);
+            if (pendingUriTargets.size === 0) requestRecordEnabled = false;
+        }
+    }
+
+    function resolveUri(uri, m3u8Url) {
+        if (!uri) return uri;
+        if (/^(https?:|data:|blob:|skd:)/i.test(uri)) return uri;
+
+        if (uriHits.has(uri)) return uriHits.get(uri);
+
+        try {
+            return new URL(uri, m3u8Url).href;
+        } catch (e) {
+            return uri;
+        }
+    }
+
+    function absolutizeAttrUri(line, m3u8Url) {
+        if (!m3u8Url) return line;
+        if (!line.startsWith('#EXT-X-KEY') && !line.startsWith('#EXT-X-MAP')) {
+            return line;
+        }
+        return line.replace(/URI="([^"]*)"/g, (m, uri) => {
+            if (!uri) return m;
+            return `URI="${resolveUri(uri, m3u8Url)}"`;
+        });
     }
 
     // ============================================================
@@ -805,7 +922,7 @@
     }
 
     // ============================================================
-    // 9. 数字递增检测
+    // 9. 数字递增检测（公差 + 跳变分析）
     // ============================================================
     function collectNumericSeq(lines) {
         const samples = [];
@@ -823,15 +940,63 @@
 
         if (samples.length < 3) return { ok: false };
 
-        let match = 0;
+        // 1. 差值众数作为公差 step
+        const diffFreq = new Map();
         for (let i = 1; i < samples.length; i++) {
-            if (samples[i].num === samples[i - 1].num + 1) match++;
+            const d = samples[i].num - samples[i - 1].num;
+            diffFreq.set(d, (diffFreq.get(d) || 0) + 1);
         }
 
+        let step = 0, stepCount = 0;
+        for (const [d, c] of diffFreq) {
+            if (c > stepCount || (c === stepCount && d > 0)) {
+                stepCount = c;
+                step = d;
+            }
+        }
+
+        if (step <= 0 || step > 10) return { ok: false };
+
+        // 2. 比例 ≥ 0.8
+        const ratio = stepCount / (samples.length - 1);
+        if (ratio < 0.8) return { ok: false };
+
+        // 3. 找第一个跳变点
+        let jumpIdx = -1;
+        for (let i = 1; i < samples.length; i++) {
+            if (samples[i].num !== samples[i - 1].num + step) {
+                jumpIdx = i;
+                break;
+            }
+        }
+
+        // 4. 无跳变
+        if (jumpIdx === -1) {
+            return {
+                ok: true,
+                firstNum: samples[0].num,
+                baseLen: samples[0].len,
+                step
+            };
+        }
+
+        // 5. 有跳变：取更长段
+        const beforeCount = jumpIdx - 1;
+        const afterCount = samples.length - 1 - jumpIdx;
+
+        if (afterCount > beforeCount) {
+            return {
+                ok: true,
+                firstNum: samples[jumpIdx].num,
+                baseLen: samples[jumpIdx].len,
+                step
+            };
+        }
         return {
-            ok: match / (samples.length - 1) >= 0.8,
+            ok: true,
             firstNum: samples[0].num,
-            baseLen: samples[0].len
+            baseLen: samples[0].len,
+            step
         };
     }
 
@@ -882,34 +1047,48 @@
     // ============================================================
     // 11. 模式检测
     // ============================================================
-    function detectMode(lines) {
-        let hasKeyNone = false, hasAdjump = false;
-        for (let i = 0, n = lines.length; i < n; i++) {
-            const line = lines[i];
-            if (line === '#EXT-X-KEY:METHOD=NONE') hasKeyNone = true;
-            else if (line.indexOf('/video/adjump/') !== -1) hasAdjump = true;
-            if (hasKeyNone && hasAdjump) break;
+    function detectMode(lines, text) {
+        const hasAdjump = text.indexOf('/video/adjump/') !== -1;
+        const hasKeyNone = text.indexOf('#EXT-X-KEY:METHOD=NONE') !== -1;
+
+        // 1. adjump 优先
+        if (hasAdjump) {
+            return { mode: TS_MODE.FEATURE, hasAdjump: true, pathInfo: null };
         }
 
-        if (hasKeyNone || hasAdjump) {
-            return { mode: TS_MODE.FEATURE, hasKeyNone, hasAdjump, pathInfo: null };
+        let pathInfo = null;
+
+        // 2. 有 keynone：先走少数派路径
+        if (hasKeyNone) {
+            pathInfo = analyzePathPrefixes(lines);
+            if (pathInfo.hasMinority || pathInfo.hasLengthAnomaly) {
+                return { mode: TS_MODE.FEATURE, hasAdjump: false, pathInfo };
+            }
         }
 
+        // 3. 数字递增
         const seq = collectNumericSeq(lines);
         if (seq.ok) {
-            return { mode: TS_MODE.NUMERIC, firstNum: seq.firstNum, baseLen: seq.baseLen };
+            return {
+                mode: TS_MODE.NUMERIC,
+                firstNum: seq.firstNum,
+                baseLen: seq.baseLen,
+                step: seq.step
+            };
         }
 
-        const pathInfo = analyzePathPrefixes(lines);
+        // 4. 少数派路径
+        if (!pathInfo) pathInfo = analyzePathPrefixes(lines);
         if (pathInfo.hasMinority || pathInfo.hasLengthAnomaly) {
-            return { mode: TS_MODE.FEATURE, hasKeyNone: false, hasAdjump: false, pathInfo };
+            return { mode: TS_MODE.FEATURE, hasAdjump: false, pathInfo };
         }
 
+        // 5. 短区间
         return { mode: TS_MODE.SHORT_INTERVAL };
     }
 
     // ============================================================
-    // 12. 通用输出：按 del[] 的连续段分块
+    // 12. 通用输出
     // ============================================================
     function emitDeletedBlocks(lines, del, reasonArr, session, defaultRule) {
         const n = lines.length;
@@ -933,9 +1112,7 @@
                     ? '规则: ' + [...reasons].join(' + ')
                     : (defaultRule || '规则: 广告段');
 
-                // ★ 日志里存数组，显示时才 join
-                const removed = [];
-                for (let k = start; k < i; k++) removed.push(lines[k]);
+                const removed = lines.slice(start, i);
                 for (let k = 0; k < removed.length; k++) {
                     session.adLines.push(removed[k]);
                 }
@@ -957,26 +1134,14 @@
     // ============================================================
     // 13. 处理器：FEATURE
     // ============================================================
-    function markKeyNone(lines, del, reasonArr) {
+    function markAdjump(lines, del, reasonArr) {
         const n = lines.length;
-        const RULE_KEY = '#EXT-X-KEY:METHOD=NONE 广告段';
         const RULE_ADJ = '/video/adjump/ 广告段';
         let anyAd = false;
         let i = 0;
 
         while (i < n) {
             const line = lines[i];
-
-            if (line === '#EXT-X-KEY:METHOD=NONE') {
-                const start = i;
-                while (i < n && !isBoundary(lines[i])) i++;
-                for (let j = start; j < i; j++) {
-                    del[j] = 1;
-                    reasonArr[j] = RULE_KEY;
-                    anyAd = true;
-                }
-                continue;
-            }
 
             if (line.startsWith('#EXT-X-DISCONTINUITY') &&
                 lines[i + 1] && lines[i + 1].startsWith('#EXTINF') &&
@@ -1014,15 +1179,23 @@
     function markPathAnomaly(lines, pathInfo, del, reasonArr) {
         const intervals = buildIntervals(lines);
         let anyAd = false;
+        const RULE_KEY = '#EXT-X-KEY:METHOD=NONE 广告段';
+        const RULE_MINORITY = '少数派路径广告段';
 
         for (const it of intervals) {
             if (it.count === 0) continue;
 
             const prefixCount = new Map();
             let totalLen = 0, uriCount = 0;
+            let hasKeyNoneInInterval = false;
+
+            if (it.start > 0 && lines[it.start - 1] === '#EXT-X-KEY:METHOD=NONE') {
+                hasKeyNoneInInterval = true;
+            }
 
             for (let i = it.start; i < it.end; i++) {
                 const line = lines[i];
+                if (line === '#EXT-X-KEY:METHOD=NONE') hasKeyNoneInInterval = true;
                 if (!isMediaSegment(line)) continue;
                 const prefix = extractPathPrefix(line);
                 prefixCount.set(prefix, (prefixCount.get(prefix) || 0) + 1);
@@ -1043,11 +1216,23 @@
                               Math.abs(avgLen - pathInfo.mainLen) / pathInfo.mainLen > LENGTH_ANOMALY_RATIO;
 
             if (hitMinority || hitLength) {
-                const reason = [];
-                if (hitMinority) reason.push('少数派路径');
-                if (hitLength) reason.push('长度异常');
-                const reasonStr = reason.join('+') + ' 广告段';
-                for (let j = it.start; j < it.end; j++) {
+                const reasonStr = hasKeyNoneInInterval ? RULE_KEY : RULE_MINORITY;
+
+                let delStart = it.start;
+                if (hasKeyNoneInInterval) {
+                    if (it.start > 0 && lines[it.start - 1] === '#EXT-X-KEY:METHOD=NONE') {
+                        delStart = it.start - 1;
+                    } else {
+                        for (let i = it.start; i < it.end; i++) {
+                            if (lines[i] === '#EXT-X-KEY:METHOD=NONE') {
+                                delStart = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                for (let j = delStart; j < it.end; j++) {
                     del[j] = 1;
                     if (!reasonArr[j]) reasonArr[j] = reasonStr;
                     anyAd = true;
@@ -1063,9 +1248,10 @@
         const del = new Uint8Array(n);
         const reasonArr = new Array(n);
         let anyAd = false;
+        const RULE_KEY = '#EXT-X-KEY:METHOD=NONE 广告段';
 
-        if (ctx.hasKeyNone || ctx.hasAdjump) {
-            anyAd = markKeyNone(lines, del, reasonArr) || anyAd;
+        if (ctx.hasAdjump) {
+            anyAd = markAdjump(lines, del, reasonArr) || anyAd;
         }
         if (ctx.pathInfo && (ctx.pathInfo.hasMinority || ctx.pathInfo.hasLengthAnomaly)) {
             anyAd = markPathAnomaly(lines, ctx.pathInfo, del, reasonArr) || anyAd;
@@ -1078,14 +1264,21 @@
             if (del[k]) continue;
             const prevDel = k > 0 && del[k - 1] === 1;
             const nextDel = k + 1 < n && del[k + 1] === 1;
-            if (prevDel || nextDel) del[k] = 1;
+            if (prevDel || nextDel) {
+                del[k] = 1;
+                if (k + 1 < n &&
+                    lines[k + 1] === '#EXT-X-KEY:METHOD=NONE' && !del[k + 1]) {
+                    del[k + 1] = 1;
+                    if (!reasonArr[k + 1]) reasonArr[k + 1] = RULE_KEY;
+                }
+            }
         }
 
-        return emitDeletedBlocks(lines, del, reasonArr, session, '规则: 特征广告段');
+        return emitDeletedBlocks(lines, del, reasonArr, session, '规则: 广告段');
     }
 
     // ============================================================
-    // 14. 处理器：NUMERIC
+    // 14. 处理器：NUMERIC（内联 normalize）
     // ============================================================
     function filterNumeric(lines, ctx, session) {
         const n = lines.length;
@@ -1093,6 +1286,7 @@
         const reasonArr = new Array(n);
         const RULE = '数字递增异常广告段';
         let anyAd = false;
+        const step = ctx.step || 1;
 
         let mediaSeq = 0;
         for (let i = 0; i < n; i++) {
@@ -1109,18 +1303,13 @@
             logInfo('NUMERIC 模式:',
                 'firstNum=' + ctx.firstNum,
                 'mediaSeq=' + mediaSeq,
-                'offset=' + offset);
+                'offset=' + offset,
+                'step=' + step);
         }
 
         let prevNum = mediaSeq - 1;
-
-        function normalize(uri) {
-            const info = parseMediaUri(uri);
-            if (!info) return null;
-            return { num: info.num - offset, len: info.len };
-        }
-
         let i = 0;
+
         while (i < n) {
             const line = lines[i];
 
@@ -1130,15 +1319,18 @@
                     continue;
                 }
 
-                const info = normalize(lines[i + 2]);
-                if (info && info.num !== prevNum + 1) {
-                    del[i] = 1;
-                    del[i + 1] = 1;
-                    del[i + 2] = 1;
-                    reasonArr[i] = reasonArr[i + 1] = reasonArr[i + 2] = RULE;
-                    anyAd = true;
-                    i += 3;
-                    continue;
+                const info = parseMediaUri(lines[i + 2]);
+                if (info) {
+                    const num = info.num - offset;
+                    if (num !== prevNum + step) {
+                        del[i] = 1;
+                        del[i + 1] = 1;
+                        del[i + 2] = 1;
+                        reasonArr[i] = reasonArr[i + 1] = reasonArr[i + 2] = RULE;
+                        anyAd = true;
+                        i += 3;
+                        continue;
+                    }
                 }
 
                 i++;
@@ -1146,9 +1338,10 @@
             }
 
             if (line.startsWith('#EXTINF') && lines[i + 1]) {
-                const info = normalize(lines[i + 1]);
+                const info = parseMediaUri(lines[i + 1]);
                 if (info) {
-                    if (info.num !== prevNum + 1) {
+                    const num = info.num - offset;
+                    if (num !== prevNum + step) {
                         del[i] = 1;
                         del[i + 1] = 1;
                         reasonArr[i] = reasonArr[i + 1] = RULE;
@@ -1157,7 +1350,7 @@
                         continue;
                     }
 
-                    prevNum = info.num;
+                    prevNum = num;
                     i += 2;
                     continue;
                 }
@@ -1314,7 +1507,6 @@
             }
         }
 
-        // ★ 短区间数量限制：超过上限时，只删除片段数 ≤ SHORT_AD_FRAGMENT_THRESHOLD 的短区间
         if (shortIntervals.size > SHORT_AD_MAX_INTERVALS) {
             const kept = new Set();
             for (const it of shortIntervals) {
@@ -1352,7 +1544,6 @@
     // 17. 统一入口
     // ============================================================
     function processM3U8(text, url) {
-        // ★ 快速失败：只看前 64 字节 + 长度上限
         if (!text || typeof text !== 'string' || text.slice(0, 64).indexOf('#EXTM3U') === -1) {
             return { modified: text, changed: false, session: null, isMaster: false };
         }
@@ -1369,18 +1560,15 @@
 
         const session = createSession(url || '');
 
-        // ★ 合并遍历：清理冗余 DISC + 统计 segmentCount + 收集 headLines
         const lines = [];
         const headLines = [];
-        let segmentCount = 0;
+        let hasExtinf = false;
+        let hasStreamInf = false;
         let inHead = true;
 
         for (let i = 0; i < rawLines.length; i++) {
             const line = rawLines[i];
 
-            // 清理冗余 DISC：
-            // 1) 连续多个 DISC 只保留第一个
-            // 2) DISC 后紧跟 ENDLIST 时删除该 DISC
             if (line.startsWith('#EXT-X-DISCONTINUITY')) {
                 if (lines.length > 0 && lines[lines.length - 1].startsWith('#EXT-X-DISCONTINUITY')) {
                     continue;
@@ -1392,16 +1580,18 @@
 
             if (line.startsWith('#EXTINF')) {
                 inHead = false;
-                const uri = rawLines[i + 1];
-                if (uri && isMediaSegment(uri)) segmentCount++;
+                hasExtinf = true;
+            } else if (line.startsWith('#EXT-X-STREAM-INF')) {
+                hasStreamInf = true;
             }
 
             if (inHead) headLines.push(line);
             lines.push(line);
         }
 
-        if (segmentCount === 0) {
-            if (DEBUG) logInfo('master playlist，跳过:', url);
+        // ★ 无 #EXTINF → 不是 media playlist
+        if (!hasExtinf) {
+            if (DEBUG) logInfo(hasStreamInf ? 'master playlist，跳过:' : '无 #EXTINF，跳过:', url);
             return { modified: text, changed: false, session: null, isMaster: true };
         }
 
@@ -1410,8 +1600,30 @@
             session.headLines.unshift('#EXTM3U');
         }
 
+        // ★ 提取 KEY/MAP 相对 URI，开启请求记录
+        const uriTargets = extractUriTargets(lines);
+        uriHits.clear();
+        pendingUriTargets = uriTargets;
+        if (uriTargetTimer) {
+            clearTimeout(uriTargetTimer);
+            uriTargetTimer = null;
+        }
+        if (unsafeWindow.self !== unsafeWindow.top) {
+            notifyTopResetUriHits();
+        }
+        if (uriTargets.size > 0) {
+            requestRecordEnabled = true;
+            uriTargetTimer = setTimeout(() => {
+                requestRecordEnabled = false;
+                pendingUriTargets.clear();
+                uriTargetTimer = null;
+            }, URI_TARGET_TIMEOUT_MS);
+        } else {
+            requestRecordEnabled = false;
+        }
+
         const m3u8Host = getHostFromUrl(url);
-        const ctx = detectMode(lines);
+        const ctx = detectMode(lines, text);
         logInfo('模式:', ctx.mode);
 
         let out;
@@ -1423,7 +1635,6 @@
             default:                     out = lines;
         }
 
-        // ★ 无广告过滤，且没有清理 DISC 时，直接返回原文，避免一次 join
         const finalLines = session.changed ? out : lines;
         if (!session.changed && lines.length === rawLines.length) {
             session.filtered = text;
@@ -1460,8 +1671,11 @@
 
         for (const line of activeSession.adLines) {
             if (!line) continue;
-            if (line.startsWith('#')) resultLines.push(line);
-            else resultLines.push(makeAbsolute(line, activeSession.url));
+            if (line.startsWith('#')) {
+                resultLines.push(absolutizeAttrUri(line, activeSession.url));
+            } else {
+                resultLines.push(resolveUri(line, activeSession.url));
+            }
         }
 
         if (!resultLines.includes('#EXT-X-ENDLIST')) resultLines.push('#EXT-X-ENDLIST');
@@ -1479,8 +1693,11 @@
         const out = [];
         for (const line of lines) {
             if (!line) { out.push(line); continue; }
-            if (line.startsWith('#')) out.push(line);
-            else out.push(makeAbsolute(line, activeSession.url));
+            if (line.startsWith('#')) {
+                out.push(absolutizeAttrUri(line, activeSession.url));
+            } else {
+                out.push(resolveUri(line, activeSession.url));
+            }
         }
 
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -1567,11 +1784,8 @@
     }
 
     // ============================================================
-    // 20. Hook: XHR（★ 非 m3u8 请求直接放行）
+    // 20. Hook: XHR（Proxy）
     // ============================================================
-    const URL_SYM = Symbol('m3u8ar_url');
-    const CACHE_SYM = Symbol('m3u8ar_cache');
-
     function hookXHR() {
         const XHRProto = unsafeWindow.XMLHttpRequest && unsafeWindow.XMLHttpRequest.prototype;
         if (!XHRProto) return;
@@ -1589,9 +1803,9 @@
 
         const openProxy = new Proxy(origOpen, {
             apply(target, thisArg, args) {
-                // ★ 只记录 URL，不在实例上写属性（避免改变隐藏类）
                 try {
                     URL_MAP.set(thisArg, args[1] || '');
+                    recordRequestUrl(args[1] || '');
                 } catch (e) {}
                 return Reflect.apply(target, thisArg, args);
             }
@@ -1602,7 +1816,6 @@
                 const xhr = thisArg;
                 const reqUrl = URL_MAP.get(xhr) || '';
 
-                // ★ 非 m3u8 请求直接放行，不做任何 hook
                 if (!looksLikeM3U8(reqUrl)) {
                     return Reflect.apply(target, thisArg, args);
                 }
@@ -1618,7 +1831,6 @@
                         original = '';
                     }
 
-                    // ★ 只看前 64 字节
                     if (!original || original.slice(0, 64).indexOf('#EXTM3U') === -1) {
                         RESP_CACHE.set(xhr, original);
                         return original;
@@ -1701,7 +1913,7 @@
     }
 
     // ============================================================
-    // 21. Hook: fetch（★ 非 m3u8 URL 不 clone 响应）
+    // 21. Hook: fetch（Proxy）
     // ============================================================
     function hookFetch() {
         const origFetch = unsafeWindow.fetch;
@@ -1711,12 +1923,12 @@
 
         const fetchProxy = new Proxy(origFetch, {
             apply(target, thisArg, args) {
-                // 同步提取 URL
                 let url = '';
                 if (typeof args[0] === 'string') url = args[0];
                 else if (args[0] && typeof args[0].url === 'string') url = args[0].url;
 
-                // ★ URL 不像 m3u8，直接放行，绝不 clone
+                if (url) recordRequestUrl(url);
+
                 if (!looksLikeM3U8(url)) {
                     return Reflect.apply(target, thisArg, args);
                 }
@@ -1784,10 +1996,22 @@
         unsafeWindow.addEventListener('message', function (e) {
             const d = e.data;
             if (!d || d.__m3u8ar !== true) return;
+
+            // 子 frame 命中 key/map URI
+            if (d.type === 'uriHit') {
+                if (d.target && d.url) uriHits.set(d.target, d.url);
+                return;
+            }
+
+            // 子 frame 处理新 m3u8，清空 top 的 uriHits
+            if (d.type === 'resetUriHits') {
+                uriHits.clear();
+                return;
+            }
+
             if (d.type !== 'processed') return;
 
             updateActiveSession(d.session);
-
             updateFilterTip();
 
             const hasAds = activeSession.adLines.length > 0;
@@ -1905,7 +2129,7 @@
     }
 
     // ============================================================
-    // 24. 视频加载检测（★ MutationObserver 节流 + 找到即断开）
+    // 24. 视频加载检测
     // ============================================================
     function monitorVideo() {
         if (!shouldEnableHook()) return;
@@ -1960,7 +2184,6 @@
 
         if (tryAttach()) return;
 
-        // ★ 回调只做标志检查；querySelector 放到 300ms 节流里
         observer = new MutationObserver(() => {
             if (foundVideo || moTimer) return;
             moTimer = setTimeout(() => {

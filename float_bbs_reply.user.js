@@ -2,7 +2,7 @@
 // @name        论坛悬浮回复框
 // @description 常用论坛的悬浮回复框，点击固定，再次点击缩回
 // @namespace   https://github.com/dxdragon/UserScripts
-// @author       Shay
+// @author      Shay
 // @match       *://*/*thread*
 // @match       *://*/*forum*
 // @match       *://*/*bbs*
@@ -39,22 +39,23 @@
     const DEF = {
         WIDTH:  30,
         HEIGHT: 30,
-        AT_X:   10,    // 图标左边缘相对 #wp 右边缘的偏移（正=越出 wp 往右）
-        AT_Y:   -40,   // 距视口底部 40px
+        AT_X:   10,
+        AT_Y:   -40,
     };
 
     const EDGE_PADDING = 5;
 
     const DEFAULT_ICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='32' fill='%234a90e2'/%3E%3Cpath d='M14 18H50V46H28L18 56V46H14Z' fill='%23fff'/%3E%3Ccircle cx='24' cy='32' r='3' fill='%234a90e2'/%3E%3Ccircle cx='32' cy='32' r='3' fill='%234a90e2'/%3E%3Ccircle cx='40' cy='32' r='3' fill='%234a90e2'/%3E%3C/svg%3E";
 
-    const TARGET_SELECTORS = [
+    // 合并成一个复合选择器，一次 querySelectorAll
+    const TARGET_SELECTOR = [
         '#anchor',
         '#quickpost',
         '#f_pst',
         '#f_post',
         '#fast_post_c',
         'form[action="post.php?"][method="post"] > .t5',
-    ];
+    ].join(',');
 
     /* =========================================================
      *  配置读写
@@ -69,7 +70,7 @@
     const setVal = (key, value) => GM_setValue(key, String(value));
 
     /* =========================================================
-     *  样式（关键：回复框相关都加 !important，防止被论坛覆盖）
+     *  样式（与 1.1 保持一致）
      * ========================================================= */
 
     const STYLE = `
@@ -148,10 +149,6 @@
         (document.head || document.documentElement).appendChild(el);
     };
 
-    /* =========================================================
-     *  工具：带 !important 设置样式
-     * ========================================================= */
-
     const setStyle = (el, props) => {
         for (const [k, v] of Object.entries(props)) {
             el.style.setProperty(k, v, 'important');
@@ -159,7 +156,7 @@
     };
 
     /* =========================================================
-     *  设置面板
+     *  设置面板（未改动）
      * ========================================================= */
 
     class SettingsPanel {
@@ -274,15 +271,14 @@
     }
 
     /* =========================================================
-     *  布局辅助
+     *  布局辅助（读一次，多处复用，减少强制回流）
      * ========================================================= */
 
     const getWpRect = () => {
         const wp = document.querySelector('#wp');
         if (!wp) return null;
         const r = wp.getBoundingClientRect();
-        if (r.width < 100) return null;
-        return r;
+        return r.width >= 100 ? r : null;
     };
 
     /* =========================================================
@@ -293,9 +289,12 @@
         constructor(target, settingsPanel) {
             this.target = target;
             this.settingsPanel = settingsPanel;
-            this.expanded = false;
+            this.expanded = false;    // 用户主动固定
+            this.hovering = false;    // 鼠标在图标/回复框内
+            this.composing = false;   // 输入法组合中
             this.icon = null;
             this._hideTimer = null;
+            this._lastExpand = null;  // 缓存展开状态，避免冗余写 DOM
             this._build();
         }
 
@@ -307,7 +306,6 @@
             this.target.classList.add('frep_reply');
             this.target.dataset.expand = '0';
 
-            // 表单提交后自动收起
             const form = this.target.tagName === 'FORM'
                 ? this.target
                 : this.target.querySelector('form');
@@ -317,7 +315,6 @@
                 });
             }
 
-            // 创建图标
             const icon = document.createElement('div');
             icon.className = 'frep_btn';
             icon.dataset.expand = '0';
@@ -331,13 +328,16 @@
 
             this.target.parentNode.insertBefore(icon, this.target.parentNode.firstChild);
             this.icon = icon;
+            this._lastExpand = '0';
 
             this._layoutIcon();
             this._bindEvents();
         }
 
-        /** 图标定位：优先贴 #wp 右边缘；无 #wp 则贴视口右侧 */
-        _layoutIcon() {
+        /** 图标定位（wp 参数可复用，避免重复读 rect） */
+        _layoutIcon(wp) {
+            if (wp === undefined) wp = getWpRect();
+
             const width  = getInt(KEYS.WIDTH, DEF.WIDTH);
             const height = getInt(KEYS.HEIGHT, DEF.HEIGHT);
             const atX    = getInt(KEYS.AT_X, DEF.AT_X);
@@ -346,7 +346,6 @@
             const bodyH  = document.body.clientHeight;
 
             let iconLeft;
-            const wp = getWpRect();
             if (wp) {
                 iconLeft = wp.right + atX;
             } else {
@@ -356,20 +355,19 @@
             const maxLeft = Math.max(EDGE_PADDING, bodyW - width - EDGE_PADDING);
             iconLeft = Math.min(Math.max(iconLeft, EDGE_PADDING), maxLeft);
 
-            const props = {
+            setStyle(this.icon, {
                 'left':   `${Math.round(iconLeft)}px`,
                 'right':  'auto',
                 'top':    atY >= 0 ? `${atY}px` : 'auto',
                 'bottom': atY >= 0 ? 'auto' : `${Math.min(Math.abs(atY), bodyH - height - EDGE_PADDING)}px`,
                 'width':  `${width}px`,
                 'height': `${height}px`,
-            };
-            setStyle(this.icon, props);
+            });
         }
 
-        /** 回复框定位：与 #wp 完全同宽同左 */
-        _layoutReply() {
-            const wp = getWpRect();
+        /** 回复框定位（wp 参数可复用） */
+        _layoutReply(wp) {
+            if (wp === undefined) wp = getWpRect();
             const t = this.target;
 
             if (wp) {
@@ -388,7 +386,6 @@
                 });
             }
 
-            // 额外强制项，防止论坛样式干扰
             setStyle(t, {
                 'box-sizing': 'border-box',
                 'margin':     '0',
@@ -399,8 +396,19 @@
         }
 
         refreshLayout() {
-            this._layoutIcon();
-            if (this.expanded) this._layoutReply();
+            if (!this.target.isConnected) return;   // 跳过已被移除的实例
+            const wp = getWpRect();                 // 只读一次
+            this._layoutIcon(wp);
+            if (this._shouldShow()) this._layoutReply(wp);
+        }
+
+        _hasFocusInside() {
+            const a = document.activeElement;
+            return !!a && a !== document.body && this.target.contains(a);
+        }
+
+        _shouldShow() {
+            return this.expanded || this.hovering || this.composing || this._hasFocusInside();
         }
 
         _bindEvents() {
@@ -417,45 +425,88 @@
                 this.settingsPanel.toggle();
             });
 
-            icon.addEventListener('mouseenter', () => this._cancelHide());
-            icon.addEventListener('mouseleave', () => this._scheduleHide());
-            target.addEventListener('mouseenter', () => this._cancelHide());
-            target.addEventListener('mouseleave', () => this._scheduleHide());
+            const onEnter = () => {
+                this.hovering = true;
+                this._cancelHide();
+                this._apply();
+            };
+            const onLeave = () => {
+                this.hovering = false;
+                this._scheduleHide();
+            };
+
+            icon.addEventListener('mouseenter', onEnter);
+            icon.addEventListener('mouseleave', onLeave);
+            target.addEventListener('mouseenter', onEnter);
+            target.addEventListener('mouseleave', onLeave);
+
+            target.addEventListener('focusin', () => {
+                this._cancelHide();
+                this._apply();
+            });
+
+            target.addEventListener('focusout', () => {
+                setTimeout(() => {
+                    if (this._hasFocusInside()) return;
+                    this._scheduleHide();
+                }, 0);
+            });
+
+            // 输入法组合事件：浮条抢焦点时保持展开
+            target.addEventListener('compositionstart', () => {
+                this.composing = true;
+                this._cancelHide();
+                this._apply();
+            });
+            target.addEventListener('compositionend', () => {
+                this.composing = false;
+            });
         }
 
         _cancelHide() {
-            clearTimeout(this._hideTimer);
-            if (!this.expanded) this._show();
+            if (this._hideTimer) {
+                clearTimeout(this._hideTimer);
+                this._hideTimer = null;
+            }
         }
 
         _scheduleHide() {
-            if (this.expanded) return;
-            clearTimeout(this._hideTimer);
-            this._hideTimer = setTimeout(() => this._hide(), 200);
+            this._cancelHide();
+            if (this._shouldShow()) return;
+
+            this._hideTimer = setTimeout(() => {
+                this._hideTimer = null;
+                if (this._shouldShow()) return;
+                this._apply();
+            }, 200);
         }
 
         toggle() { this.expanded ? this.collapse() : this.expand(); }
 
         expand() {
             this.expanded = true;
-            this._show();
-            this.icon.dataset.expand = '1';
+            this._cancelHide();
+            this._apply();
         }
 
         collapse() {
             this.expanded = false;
-            this._hide();
-            this.icon.dataset.expand = '0';
+            this.hovering = false;
+            this._cancelHide();
+            this._apply();
         }
 
-        /** 统一入口：任何展开路径都会重排 */
-        _show() {
-            this._layoutReply();
-            this.target.dataset.expand = '1';
-        }
+        /** 统一入口：状态没变化时直接 return，避免冗余 DOM 写入 */
+        _apply() {
+            const show = this._shouldShow();
+            const newVal = show ? '1' : '0';
+            if (this._lastExpand === newVal) return;
 
-        _hide() {
-            this.target.dataset.expand = '0';
+            this._lastExpand = newVal;
+            this.target.dataset.expand = newVal;
+            this.icon.dataset.expand = newVal;
+
+            if (show) this._layoutReply();
         }
     }
 
@@ -469,7 +520,6 @@
         const panel = new SettingsPanel();
         GM_registerMenuCommand('设置论坛回复悬浮窗属性', () => panel.toggle());
 
-        /** @type {FloatingReply[]} */
         const instances = [];
         const initialized = new WeakSet();
 
@@ -484,26 +534,33 @@
         };
 
         const scan = () => {
-            for (const selector of TARGET_SELECTORS) {
-                tryInit(document.querySelector(selector));
-            }
+            const nodes = document.querySelectorAll(TARGET_SELECTOR);
+            for (const node of nodes) tryInit(node);
         };
 
         scan();
 
-        // 动态加载的回复框（AJAX 场景）
-        let scheduled = false;
-        const observer = new MutationObserver(() => {
-            if (scheduled) return;
-            scheduled = true;
-            requestAnimationFrame(() => {
-                scheduled = false;
+        // 优化：只对"新增节点"做响应 + 100ms setTimeout 防抖
+        let scanTimer = null;
+        const scheduleScan = () => {
+            if (scanTimer) return;
+            scanTimer = setTimeout(() => {
+                scanTimer = null;
                 scan();
-            });
+            }, 100);
+        };
+
+        const observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (m.addedNodes.length > 0) {
+                    scheduleScan();
+                    return;
+                }
+            }
         });
         observer.observe(document.body, { childList: true, subtree: true });
 
-        // 窗口大小变化 → 重排所有实例
+        // resize：rAF 节流 + isConnected 过滤
         let resizeScheduled = false;
         window.addEventListener('resize', () => {
             if (resizeScheduled) return;
@@ -514,12 +571,14 @@
             });
         });
 
-        // ESC 关闭全部
+        // ESC：输入法组合中或焦点在回复框内时不响应
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' || e.keyCode === 27) {
-                for (const r of instances) r.collapse();
-                panel.close();
-            }
+            if (e.key !== 'Escape' && e.keyCode !== 27) return;
+            if (e.isComposing) return;
+            const a = document.activeElement;
+            if (a && a !== document.body && a.closest && a.closest('.frep_reply')) return;
+            for (const r of instances) r.collapse();
+            panel.close();
         });
     };
 

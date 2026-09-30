@@ -2,7 +2,7 @@
 // @name         外链解码直链跳转
 // @namespace    http://tampermonkey.net/
 // @version      1.0
-// @description  外链解码原链接、去跳转，短链接直达
+// @description  外链解码原链接、去跳转，短链接直达（性能优化版）
 // @author       Shay
 // @match        *://*/*
 // @exclude      *://*/*play/*
@@ -24,6 +24,20 @@
     const ENABLE_SHORTLINK_EXPAND = true;
     const SHORTLINK_TIMEOUT = 5000;
 
+    // ★ 是否重写页面链接 href。关闭后页面加载几乎零开销，
+    //   只保留点击拦截 + 地址栏自动跳转。
+    const ENABLE_LINK_REWRITE = true;
+
+    // MutationObserver 最长观察时间（毫秒）
+    const REWRITE_OBSERVER_TIMEOUT = 15000;
+
+    // 短链缓存上限
+    const SHORTLINK_CACHE_MAX = 200;
+
+    // ★ 快速预筛：只有字符串里出现这些特征才进入完整解码流程
+    const QUICK_DECODE_RE =
+        /(?:\/redirect(?:[?#]|$)|[?&](?:golink|url|target|link)=|go\.php|\/target\/)/i;
+
     // ============================================================
     // 站点规则
     // ============================================================
@@ -38,15 +52,13 @@
             name: 'gndown',
             test: (host, path) => /(^|\.)gndown\.com$/i.test(host) && path.startsWith('/target/'),
             getTarget: (urlObj) => {
-                // 取出 /target/ 之后的部分
                 const m = urlObj.pathname.match(/^\/target\/(.+)$/);
                 if (!m) return null;
-                // 路径段可能被 URL 编码（如 = 变成 %3D），先解码
                 try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
             },
             decode: 'base64'
         },
-                {
+        {
             name: '423down',
             test: (host, path) => host.includes('423down.com') && path.includes('/go.php'),
             getTarget: (urlObj) => urlObj.searchParams.get('url'),
@@ -96,8 +108,6 @@
             }
         },
         {
-            // 只用于把 /shorts/ 统一成 /watch?v=（补全而非去短）
-            // needsShortlinkResolution 会保证 /watch?v= 这种已经正常的地址不被误判
             domains: ['youtube.com'],
             expand: (url) => {
                 const m = url.match(/^https?:\/\/www\.youtube\.com\/shorts\/([\w-]+)/i);
@@ -115,11 +125,25 @@
         },
     ];
 
+    // ★ 短链域名 → 规则 的 Map，避免每次线性遍历
+    const SHORTLINK_RULE_MAP = new Map();
+    for (const rule of SHORTLINK_RULES) {
+        for (const d of rule.domains) {
+            SHORTLINK_RULE_MAP.set(d.toLowerCase(), rule);
+        }
+    }
+
     // ============================================================
     // 解码工具
     // ============================================================
+    const BASE64_ONLY_RE = /^[A-Za-z0-9+/_=-]+$/;
+
     function tryBase64Decode(str) {
-        if (!str || typeof str !== 'string') return null;
+        if (!str || typeof str !== 'string' || str.length < 8) return null;
+        // ★ 快速预检：含 % 或 :// 一定不是纯 base64，直接放弃
+        if (str.includes('%') || str.includes('://')) return null;
+        if (!BASE64_ONLY_RE.test(str)) return null;
+
         try {
             const normalized = str.replace(/-/g, '+').replace(/_/g, '/');
             const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
@@ -127,32 +151,41 @@
             return /^https?:\/\//i.test(decoded) ? decoded : null;
         } catch (e) { return null; }
     }
+
     function tryUriDecode(str) {
         if (!str || typeof str !== 'string') return null;
-        // 没有 % 说明根本没被 URL 编码，不要当成"解码成功"
         if (!str.includes('%')) return null;
         try {
             const decoded = decodeURIComponent(str);
             return /^https?:\/\//i.test(decoded) ? decoded : null;
         } catch (e) { return null; }
     }
+
     function decodeByMode(raw, mode) {
         if (!raw) return null;
         switch (mode) {
-            case 'base64': return tryBase64Decode(raw);
-            case 'uri':    return tryUriDecode(raw);
+            case 'base64':
+                return tryBase64Decode(raw);
+            case 'uri':
+                return tryUriDecode(raw);
             case 'base64+uri': {
-                let r = tryBase64Decode(raw);
-                if (r) return r;
-                r = tryUriDecode(raw);
-                if (r) return r;
-                const uriDecoded = (() => {
-                    try { return decodeURIComponent(raw); } catch { return raw; }
-                })();
-                return tryBase64Decode(uriDecoded);
+                const b64 = tryBase64Decode(raw);
+                if (b64) return b64;
+
+                const uri = tryUriDecode(raw);
+                if (uri) return uri;
+
+                if (raw.includes('%')) {
+                    try {
+                        return tryBase64Decode(decodeURIComponent(raw));
+                    } catch (e) {}
+                }
+                return null;
             }
-            case 'none': return /^https?:\/\//i.test(raw) ? raw : null;
-            default:     return null;
+            case 'none':
+                return /^https?:\/\//i.test(raw) ? raw : null;
+            default:
+                return null;
         }
     }
 
@@ -160,22 +193,22 @@
     // 短链接工具
     // ============================================================
 
-    // 找到匹配的短链接规则（只看域名）
+    // ★ 用域名层级查 Map，避免遍历整个规则列表
     function findShortlinkRule(url) {
-        try {
-            const host = new URL(url).hostname.toLowerCase();
-            for (const rule of SHORTLINK_RULES) {
-                if (rule.domains.some(d => host === d || host.endsWith('.' + d))) {
-                    return rule;
-                }
-            }
-        } catch (e) {}
+        let host;
+        try { host = new URL(url).hostname.toLowerCase(); } catch (e) { return null; }
+
+        let h = host;
+        while (h) {
+            const rule = SHORTLINK_RULE_MAP.get(h);
+            if (rule) return rule;
+            const idx = h.indexOf('.');
+            if (idx === -1) break;
+            h = h.slice(idx + 1);
+        }
         return null;
     }
 
-    // 判断该 URL 是否真的需要短链接处理：
-    // - 有 expand 的：只有 expand 结果与原文不同才算需要
-    // - 没有 expand 的：域名命中就算需要（走远程解析）
     function needsShortlinkResolution(url) {
         if (!ENABLE_SHORTLINK_EXPAND) return false;
         const rule = findShortlinkRule(url);
@@ -189,10 +222,9 @@
                 return false;
             }
         }
-        return true; // 无 expand → 需远程解析
+        return true;
     }
 
-    // 同步解析：只有 expand 命中才返回结果，否则返回 null
     function trySyncResolveShortlink(url) {
         if (!ENABLE_SHORTLINK_EXPAND) return null;
         const rule = findShortlinkRule(url);
@@ -204,18 +236,30 @@
         return null;
     }
 
-    // 异步解析（本地不能展开时使用）
-    function resolveShortlink(url) {
-        return new Promise((resolve) => {
-            if (!ENABLE_SHORTLINK_EXPAND) { resolve(url); return; }
+    // ★ 缓存 + 并发去重
+    const shortlinkCache = new Map();
+    const shortlinkPending = new Map();
 
+    function resolveShortlink(url) {
+        if (!ENABLE_SHORTLINK_EXPAND) return Promise.resolve(url);
+
+        if (shortlinkCache.has(url)) {
+            return Promise.resolve(shortlinkCache.get(url));
+        }
+        if (shortlinkPending.has(url)) {
+            return shortlinkPending.get(url);
+        }
+
+        const p = new Promise((resolve) => {
             const sync = trySyncResolveShortlink(url);
             if (sync) { resolve(sync); return; }
 
             const rule = findShortlinkRule(url);
-            if (!rule) { resolve(url); return; }
+            if (!rule || typeof GM_xmlhttpRequest !== 'function') {
+                resolve(url);
+                return;
+            }
 
-            if (typeof GM_xmlhttpRequest !== 'function') { resolve(url); return; }
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: url,
@@ -225,14 +269,28 @@
                 onerror: () => resolve(url),
                 ontimeout: () => resolve(url),
             });
+        }).then(final => {
+            if (shortlinkCache.size >= SHORTLINK_CACHE_MAX) {
+                shortlinkCache.clear();
+            }
+            shortlinkCache.set(url, final);
+            shortlinkPending.delete(url);
+            return final;
         });
+
+        shortlinkPending.set(url, p);
+        return p;
     }
 
     // ============================================================
-    // 解码入口：解码 + 同步短链接展开
+    // 解码入口
     // ============================================================
     function decodeUrl(rawUrl) {
         if (!rawUrl) return null;
+
+        // ★ 快速预筛：绝大多数普通链接在这里就被拒掉
+        if (!QUICK_DECODE_RE.test(rawUrl)) return null;
+
         let urlObj;
         try { urlObj = new URL(rawUrl, location.href); } catch (e) { return null; }
         if (!/^https?:$/i.test(urlObj.protocol)) return null;
@@ -272,7 +330,6 @@
         }
         const win = window.open(url, '_blank');
         if (!win) {
-            //console.warn('[外链解码] 新标签页被拦截，改为当前标签页打开');
             location.href = url;
         }
     }
@@ -287,15 +344,17 @@
         if (!link) return;
 
         const href = link.href;
-        const decoded = decodeUrl(href);      // 已经过同步短链展开
-        const target = decoded || href;
 
-        // ★ 关键修复：只有当 expand 真的能改变目标、或需远程解析时才算“短链接”
+        // ★ 快速预筛：不需要解码、也不像短链 → 立即放行
+        const maybeDecode = QUICK_DECODE_RE.test(href);
+        const maybeShort = ENABLE_SHORTLINK_EXPAND && findShortlinkRule(href);
+        if (!maybeDecode && !maybeShort) return;
+
+        const decoded = maybeDecode ? decodeUrl(href) : null;
+        const target = decoded || href;
         const isShortlink = needsShortlinkResolution(target);
 
-        // 既不是编码链接，也不是需要处理的短链接 → 放行
         if (!decoded && !isShortlink) return;
-        // 解码前后相同，且不需要短链接处理 → 放行
         if (decoded === href && !isShortlink) return;
 
         e.preventDefault();
@@ -303,85 +362,114 @@
         e.stopImmediatePropagation();
 
         if (isShortlink) {
-            // 优先同步解析（youtu.be 等本地可展开的）
             const sync = trySyncResolveShortlink(target);
             if (sync) {
-                //console.log(`[外链解码] 同步直达 → 新标签: ${target}\n          -> ${sync}`);
                 openInNewTab(sync);
                 return;
             }
 
-            // 同步失败：异步解析，预开空白页占位
             const presetWin = window.open('about:blank', '_blank');
-            //console.log(`[外链解码] 异步解析短链接: ${target}`);
             resolveShortlink(target).then(finalUrl => {
                 const final = finalUrl || target;
-                //console.log(`[外链解码] 新标签页直达: ${final}`);
                 openInNewTab(final, presetWin);
             });
         } else {
-            // 普通编码链接 / 已解析完成的地址：同步打开
-            //console.log(`[外链解码] 点击拦截 → 新标签: ${href}\n          -> ${target}`);
             openInNewTab(target);
         }
-    }, true);
+    }, { capture: true, passive: false });
 
     // ============================================================
-    // 2. 重写页面上链接的 href（同步）
+    // 2. 重写页面上链接的 href（可选，同步）
     // ============================================================
-    function rewriteLinks(root) {
-        if (!root || !root.querySelectorAll) return;
-        root.querySelectorAll('a[href]').forEach(link => {
-            if (link.dataset.__decoded) return;
+    if (ENABLE_LINK_REWRITE) {
+        const checkedLinks = new WeakSet();
+
+        function processLink(link) {
+            if (!link || !link.href) return;
+            if (checkedLinks.has(link)) return;
+            checkedLinks.add(link);
+
             const href = link.href;
+            // ★ 快速预筛，避免大量普通链接进入 URL / 规则流程
+            if (!QUICK_DECODE_RE.test(href)) return;
+
             const decoded = decodeUrl(href);
             if (decoded && decoded !== href) {
                 link.dataset.__originalHref = href;
                 link.href = decoded;
                 link.dataset.__decoded = '1';
             }
-        });
-    }
+        }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => rewriteLinks(document));
-    } else {
-        rewriteLinks(document);
-    }
+        function rewriteLinks(root) {
+            if (!root || !root.querySelectorAll) return;
+            root.querySelectorAll('a[href]').forEach(processLink);
+        }
 
-    function startObserver() {
-        const target = document.documentElement || document.body || document;
-        if (!target) return;
-        const observer = new MutationObserver(mutations => {
-            for (const m of mutations) {
-                for (const node of m.addedNodes) {
-                    if (node.nodeType !== 1) continue;
-                    if (node.tagName === 'A' && node.href) {
-                        const href = node.href;
-                        const decoded = decodeUrl(href);
-                        if (decoded && decoded !== href) {
-                            node.dataset.__originalHref = href;
-                            node.href = decoded;
-                            node.dataset.__decoded = '1';
-                        }
-                    }
-                    rewriteLinks(node);
+        // ★ 批处理新增节点，降低 MutationObserver 回调压力
+        let pendingNodes = new Set();
+        let scheduled = false;
+
+        function flushPending() {
+            scheduled = false;
+            const nodes = pendingNodes;
+            pendingNodes = new Set();
+
+            for (const n of nodes) {
+                if (n.tagName === 'A') {
+                    processLink(n);
+                } else {
+                    rewriteLinks(n);
                 }
             }
-        });
-        observer.observe(target, { childList: true, subtree: true });
-        setTimeout(() => observer.disconnect(), 15000);
+        }
+
+        function scheduleRewrite(node) {
+            if (!node || node.nodeType !== 1) return;
+            pendingNodes.add(node);
+            if (scheduled) return;
+            scheduled = true;
+
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(flushPending, { timeout: 1000 });
+            } else {
+                setTimeout(flushPending, 50);
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => rewriteLinks(document));
+        } else {
+            rewriteLinks(document);
+        }
+
+        function startObserver() {
+            const target = document.documentElement || document.body || document;
+            if (!target) return;
+
+            const observer = new MutationObserver(mutations => {
+                for (const m of mutations) {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        scheduleRewrite(node);
+                    }
+                }
+            });
+            observer.observe(target, { childList: true, subtree: true });
+            setTimeout(() => observer.disconnect(), REWRITE_OBSERVER_TIMEOUT);
+        }
+
+        if (document.documentElement) startObserver();
+        else document.addEventListener('DOMContentLoaded', startObserver);
     }
-    if (document.documentElement) startObserver();
-    else document.addEventListener('DOMContentLoaded', startObserver);
 
     // ============================================================
     // 3. 兜底：地址栏直接输入编码 URL 时，当前标签页替换
     // ============================================================
     (function autoRedirect() {
+        if (!QUICK_DECODE_RE.test(location.href)) return;
         const decoded = decodeUrl(location.href);
         if (decoded && decoded !== location.href) {
-            //console.log(`[外链解码] 页面自动跳转: ${location.href}\n          -> ${decoded}`);
             location.replace(decoded);
         }
     })();

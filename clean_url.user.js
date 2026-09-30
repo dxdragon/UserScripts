@@ -9,8 +9,6 @@
 // @run-at       document-start
 // @grant        none
 // @noframes
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/clean_url.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/clean_url.user.js
 // ==/UserScript==
 
 (function () {
@@ -91,7 +89,7 @@
         // ---- 之前脚本已有、且属于常见跟踪 ----
         'gclid', 'gclsrc', 'dclid', 'gbraid', 'wbraid', 'gad_source', 'gad_campaignid',
         'msclkid', 'fbclid', 'ttclid', 'twclid', 'li_fat_id', 'igshid', 'igsh', 'mibextid',
-        '__cft__', '__tn__', 'img_index',
+        '__cft__', '__tn__', 'img_index', 'spm',
     ].map(function (k) { return k.toLowerCase(); }));
 
     // 前缀匹配：凡是以这些字符串开头的参数一律移除
@@ -104,7 +102,7 @@
 
     // 正则匹配（匹配小写后的 key）
     const REGEX = [
-        /^weekend-reading-link-\d{6}$/i,
+        /^weekend-reading-link-\d{6}$/,
     ];
 
     // 白名单：优先级最高，命中后永不删除
@@ -113,26 +111,55 @@
         // 'si', 'ref', 'source', 'from',
     ].map(function (k) { return k.toLowerCase(); }));
 
-    /* ==================== 核心逻辑 ==================== */
+    /* ==================== 核心逻辑（优化版） ==================== */
+
+    // 前缀按首字母分组，减少遍历次数
+    const PREFIX_BY_FIRST = Object.create(null);
+    for (let i = 0; i < PREFIX.length; i++) {
+        const p = PREFIX[i];
+        const c = p.charAt(0);
+        (PREFIX_BY_FIRST[c] || (PREFIX_BY_FIRST[c] = [])).push(p);
+    }
 
     function isTracking(key) {
         if (!key) return false;
+
         const k = key.toLowerCase();
+
         if (KEEP.has(k)) return false;
         if (EXACT.has(k)) return true;
-        for (let i = 0; i < PREFIX.length; i++) {
-            if (k.indexOf(PREFIX[i]) === 0) return true;
+
+        const list = PREFIX_BY_FIRST[k.charAt(0)];
+        if (list) {
+            for (let i = 0; i < list.length; i++) {
+                if (k.startsWith(list[i])) return true;
+            }
         }
+
         for (let i = 0; i < REGEX.length; i++) {
             if (REGEX[i].test(k)) return true;
         }
+
         return false;
+    }
+
+    // 只有 key 里真的包含 % 或 + 时才解码，绝大多数参数可跳过
+    function normalizeKey(rawKey) {
+        if (rawKey.indexOf('%') === -1 && rawKey.indexOf('+') === -1) {
+            return rawKey;
+        }
+
+        try {
+            return decodeURIComponent(rawKey.replace(/\+/g, ' '));
+        } catch (e) {
+            return rawKey;
+        }
     }
 
     function stripSearch(search) {
         if (!search || search.length < 2) return null;
 
-        const body = search.charAt(0) === '?' ? search.slice(1) : search;
+        const body = search.charCodeAt(0) === 63 ? search.slice(1) : search; // 63 = '?'
         if (!body) return '';
 
         const parts = body.split('&');
@@ -145,13 +172,7 @@
 
             const eq = part.indexOf('=');
             const rawKey = eq === -1 ? part : part.slice(0, eq);
-
-            let key;
-            try {
-                key = decodeURIComponent(rawKey.replace(/\+/g, ' '));
-            } catch (e) {
-                key = rawKey;
-            }
+            const key = normalizeKey(rawKey);
 
             if (isTracking(key)) {
                 dropped = true;
@@ -167,6 +188,9 @@
     function cleanUrl(raw, base) {
         if (typeof raw !== 'string' || raw === '') return null;
 
+        // 没有 ? 就不可能带查询参数，直接跳过 new URL
+        if (raw.indexOf('?') === -1) return null;
+
         let u;
         try {
             u = new URL(raw, base || location.href);
@@ -175,6 +199,7 @@
         }
 
         if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+        if (!u.search || u.search === '?') return null;
 
         const newSearch = stripSearch(u.search);
         if (newSearch === null) return null;
@@ -184,43 +209,82 @@
     }
 
     function cleanCurrentLocation() {
+        // 用 location.search 先判断，比直接处理 location.href 更快
+        if (!location.search || location.search.length < 2) return;
+
         const clean = cleanUrl(location.href);
         if (!clean) return;
+
         try {
             history.replaceState(history.state, '', clean);
         } catch (e) { /* ignore */ }
     }
 
-    /* ==================== 各入口的拦截 ==================== */
+    /* ==================== 锚点缓存与事件拦截 ==================== */
 
-    cleanCurrentLocation();
+    // 缓存每个 <a> 上次处理过的 href，避免 pointerover 反复 new URL
+    const anchorCache = new WeakMap();
+
+    function cleanAnchor(anchor) {
+        if (!anchor) return;
+
+        const href = anchor.href;
+        const cached = anchorCache.get(anchor);
+
+        // 已经处理过同一个 href，或已经处理成 clean href，直接跳过
+        if (cached && (cached.raw === href || cached.clean === href)) return;
+
+        if (href.indexOf('?') === -1) {
+            anchorCache.set(anchor, { raw: href, clean: null });
+            return;
+        }
+
+        const clean = cleanUrl(href);
+
+        if (clean && clean !== href) {
+            anchor.href = clean;
+            anchorCache.set(anchor, { raw: href, clean });
+        } else {
+            anchorCache.set(anchor, { raw: href, clean: null });
+        }
+    }
+
+    function findAnchor(event) {
+        // 优先 closest，避免每次都创建 composedPath 数组
+        const target = event.target;
+        if (target && target.closest) {
+            const a = target.closest('a[href]');
+            if (a) return a;
+        }
+
+        // Shadow DOM 场景再退回 composedPath
+        if (typeof event.composedPath === 'function') {
+            const path = event.composedPath();
+            for (let i = 0; i < path.length; i++) {
+                const node = path[i];
+                if (
+                    node &&
+                    node.nodeType === 1 &&
+                    node.tagName === 'A' &&
+                    node.hasAttribute('href')
+                ) {
+                    return node;
+                }
+            }
+        }
+
+        return null;
+    }
 
     function handleActivate(event) {
         if (event.defaultPrevented) return;
         if (event.button !== 0 && event.button !== 1) return;
 
-        let anchor = null;
-
-        if (typeof event.composedPath === 'function') {
-            const path = event.composedPath();
-            for (let i = 0; i < path.length; i++) {
-                const node = path[i];
-                if (node && node.nodeType === 1 && node.tagName === 'A' && node.hasAttribute('href')) {
-                    anchor = node;
-                    break;
-                }
-            }
-        } else if (event.target && event.target.closest) {
-            anchor = event.target.closest('a[href]');
-        }
-
-        if (!anchor) return;
-
-        const clean = cleanUrl(anchor.href);
-        if (clean && clean !== anchor.href) {
-            anchor.href = clean;
-        }
+        const anchor = findAnchor(event);
+        if (anchor) cleanAnchor(anchor);
     }
+
+    cleanCurrentLocation();
 
     document.addEventListener('click', handleActivate, true);
     document.addEventListener('auxclick', handleActivate, true);
@@ -228,13 +292,12 @@
     document.addEventListener('pointerover', function (e) {
         const t = e.target;
         if (!t || !t.closest) return;
+
         const anchor = t.closest('a[href]');
-        if (!anchor) return;
-        const clean = cleanUrl(anchor.href);
-        if (clean && clean !== anchor.href) {
-            anchor.href = clean;
-        }
+        if (anchor) cleanAnchor(anchor);
     }, true);
+
+    /* ==================== 其他入口拦截 ==================== */
 
     try {
         const nativeOpen = window.open;

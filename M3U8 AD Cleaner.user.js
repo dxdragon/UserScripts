@@ -360,7 +360,7 @@
     // 2. 常量
     // ============================================================
     const TS_MODE = { NUMERIC: 0, FEATURE: 1, SHORT_INTERVAL: 2, NONE: 3 };
-    const MEDIA_RE = /(\d+)\.(ts|jpg|jpeg|png)/i;
+    const MEDIA_RE = /(\d+)\.(ts|jpg|jpeg|png|fmp4|m4s|mp4)/i;
     const LOG_MAX = 400;
     const MAX_M3U8_LINES = 50000;
     const MAX_M3U8_TEXT_LENGTH = 5 * 1024 * 1024;
@@ -718,7 +718,7 @@
 
     function isMediaSegment(line) {
         if (!line || line.charCodeAt(0) === 35) return false;
-        return /\.(ts|jpg|jpeg|png)($|[?#])/i.test(line);
+        return /\.(ts|jpg|jpeg|png|fmp4|m4s|mp4)($|[?#])/i.test(line);
     }
 
     function parseMediaUri(uri) {
@@ -1408,10 +1408,8 @@
         }
         const session = createSession(url || '');
         const lines = [];
-        const headLines = [];
         let hasExtinf = false;
         let hasStreamInf = false;
-        let inHead = true;
 
         for (let i = 0; i < rawLines.length; i++) {
             const line = rawLines[i];
@@ -1419,18 +1417,13 @@
                 if (lines.length > 0 && lines[lines.length - 1].startsWith('#EXT-X-DISCONTINUITY')) continue;
                 if (i + 1 < rawLines.length && rawLines[i + 1].startsWith('#EXT-X-ENDLIST')) continue;
             }
-            if (line.startsWith('#EXTINF')) { inHead = false; hasExtinf = true; }
+            if (line.startsWith('#EXTINF')) { hasExtinf = true; }
             else if (line.startsWith('#EXT-X-STREAM-INF')) hasStreamInf = true;
-            if (inHead) headLines.push(line);
             lines.push(line);
         }
         if (!hasExtinf) {
             if (DEBUG) logInfo(hasStreamInf ? 'master playlist，跳过:' : '无 #EXTINF，跳过:', url);
             return { modified: text, changed: false, session: null, isMaster: true };
-        }
-        session.headLines = headLines;
-        if (session.headLines.length === 0 || session.headLines[0] !== '#EXTM3U') {
-            session.headLines.unshift('#EXTM3U');
         }
         const uriTargets = extractUriTargets(lines);
         uriHits.clear();
@@ -1459,6 +1452,17 @@
             default:                     out = lines;
         }
         const finalLines = session.changed ? out : lines;
+
+        const headLines = [];
+        for (let i = 0; i < finalLines.length; i++) {
+            if (finalLines[i].startsWith('#EXTINF')) break;
+            headLines.push(finalLines[i]);
+        }
+        if (headLines.length === 0 || headLines[0] !== '#EXTM3U') {
+            headLines.unshift('#EXTM3U');
+        }
+        session.headLines = headLines;
+
         if (!session.changed && lines.length === rawLines.length) {
             session.filtered = text;
             return { modified: text, changed: false, session, isMaster: false };

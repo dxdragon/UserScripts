@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.4
+// @version           1.4.1
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -77,23 +77,6 @@
         } catch (e) {}
         return proxy;
     }
-
-    // ============================================================
-    // 站点策略表
-    // ============================================================
-    const SITE_PROFILES = {
-        'qinav.com': { quietPeriod: 0, hookTiming: 'domReady' },
-        'nnyy.in':   { quietPeriod: 0, hookTiming: 'immediate' },
-    };
-
-    function getSiteProfile(host) {
-        const h = (host || '').toLowerCase();
-        for (const domain in SITE_PROFILES) {
-            if (h === domain || h.endsWith('.' + domain)) return SITE_PROFILES[domain];
-        }
-        return { quietPeriod: 0, hookTiming: 'immediate' };
-    }
-    const siteProfile = getSiteProfile(unsafeWindow.location.hostname);
 
     // ============================================================
     // 0. 验证页面检测
@@ -205,6 +188,7 @@
     const ATTACHED_VIDEOS = new WeakSet();
     const URL_MAP = new WeakMap();
     const RESP_CACHE = new WeakMap();
+    const OUR_XHR_HOOKS = new WeakMap();
 
     // ============================================================
     // 1.1 原生 HLS 能力检测 + 禁用名单
@@ -339,7 +323,6 @@
         }
 
         if (detectedNonM3U8) return;
-
         if (activeSession.url) return;
 
         hlsMenuId = GM_registerMenuCommand(
@@ -375,6 +358,9 @@
     const SHORT_AD_FRAGMENT_THRESHOLD = 3;
     const URI_TARGET_TIMEOUT_MS = 30000;
     const NATIVE_HLS_DETECT_DELAY_MS = 8000;
+    const WATCHDOG_INTERVAL_MS = 500;
+    const WATCHDOG_FAIL_THRESHOLD = 5;
+    const WATCHDOG_PAUSE_MS = 30000;
 
     const currentHost = unsafeWindow.location.hostname;
     const pendingVideoChecks = new Set();
@@ -416,7 +402,6 @@
     // ============================================================
     let whitelistMode = GM_getValue('script_whitelist_mode_flag', false);
     let showToastFlag = GM_getValue('show_toast_tip_flag', false);
-    let hookArmed = siteProfile.quietPeriod === 0;
 
     let whitelistHosts = (GM_getValue('whitelist_hosts', []) || [])
         .map(s => String(s).toLowerCase())
@@ -890,8 +875,6 @@
             10000,
             () => disableNativeHlsAndReload()
         );
-
-        if (DEBUG) logInfo('原生 HLS 提示已触发:', currentHost);
     }
 
     // ============================================================
@@ -1220,9 +1203,6 @@
             }
         }
         const offset = ctx.firstNum - mediaSeq;
-        if (DEBUG) logInfo('NUMERIC 模式:',
-            'firstNum=' + ctx.firstNum, 'mediaSeq=' + mediaSeq,
-            'offset=' + offset, 'step=' + step);
 
         let prevNum = mediaSeq - 1;
         let i = 0;
@@ -1347,14 +1327,13 @@
         const intervals = buildIntervals(lines);
         if (intervals.length === 0) return lines;
         const rule = matchDomainRule(m3u8Host || '');
-        logInfo(`m3u8 域名: ${m3u8Host || '(unknown)'}，规则: ${rule.name}，策略: [${rule.strategies.join(', ')}]`);
 
         const toDelete = new Map();
         const shortIntervals = new Set();
 
         for (const strategyName of rule.strategies) {
             const fn = STRATEGIES[strategyName];
-            if (!fn) { logInfo(`未知策略: ${strategyName}`); continue; }
+            if (!fn) continue;
             const partial = fn(intervals, rule.options || {}, session);
             for (const [it, reason] of partial) {
                 if (toDelete.has(it)) toDelete.set(it, toDelete.get(it) + '+' + reason);
@@ -1563,7 +1542,6 @@
 
         updateActiveSession(result.session);
 
-        // 子框架：无论是否静默期，都把 session 通知 top
         if (unsafeWindow.self !== unsafeWindow.top) {
             try {
                 unsafeWindow.top.postMessage({
@@ -1573,12 +1551,6 @@
             return;
         }
 
-        // 主框架：静默期内只更新 session，不弹 UI
-        if (!hookArmed) {
-            if (DEBUG) logInfo('静默期记录:', url,
-                'ads=' + (result.session ? result.session.adLines.length : 0));
-            return;
-        }
         updateFilterTip();
         showResultToast(result.changed, activeSession.adLines.length);
     }
@@ -1588,8 +1560,12 @@
     // ============================================================
     function hookXHR() {
         const XHRProto = unsafeWindow.XMLHttpRequest && unsafeWindow.XMLHttpRequest.prototype;
-        if (!XHRProto || HOOKED_FLAGS.get(XHRProto)) return;
-        HOOKED_FLAGS.set(XHRProto, true);
+        if (!XHRProto) return;
+
+        const stored = OUR_XHR_HOOKS.get(XHRProto);
+        if (stored && XHRProto.open === stored.open && XHRProto.send === stored.send) {
+            return;
+        }
 
         const origOpen = XHRProto.open;
         const origSend = XHRProto.send;
@@ -1689,6 +1665,7 @@
             Object.defineProperty(XHRProto, 'send', {
                 value: sendProxy, writable: true, enumerable: false, configurable: true
             });
+            OUR_XHR_HOOKS.set(XHRProto, { open: openProxy, send: sendProxy });
         } catch (e) { logError('hookXHR 失败:', e); }
     }
 
@@ -1801,8 +1778,6 @@
 
             cancelAllPendingVideoChecks();
             updateActiveSession(d.session);
-
-            if (!hookArmed) return;
             refreshHlsMenu();
             updateFilterTip();
             const hasAds = activeSession.adLines.length > 0;
@@ -1867,38 +1842,81 @@
         });
     }
 
-    // 22.2 Hook 初始化
+    // 22.2 Hook 初始化：异步延后 + Watchdog 自愈
     function doInitHooks() {
         if (hookInitialized) return;
         if (!shouldEnableHook()) return;
         hookInitialized = true;
+        scheduleInstallHooks();
+    }
+
+    // ============================================================
+    // 22.3 通用 hook 安装机制（同步 + 异步补装 + Watchdog 自愈）
+    // ============================================================
+    let hookSignatures = null;
+    let watchdogTimer = null;
+    let watchdogFailCount = 0;
+    let watchdogPausedUntil = 0;
+
+    function installHooks() {
         hookXHR();
         hookFetch();
-        monitorVideo();
 
-        if (siteProfile.quietPeriod > 0) {
-            const arm = () => setTimeout(() => {
-                hookArmed = true;
-                if (DEBUG) logInfo('静默期结束');
-                updateFilterTip();
+        hookSignatures = {
+            fetch: unsafeWindow.fetch,
+            xhrOpen: unsafeWindow.XMLHttpRequest && unsafeWindow.XMLHttpRequest.prototype.open,
+            xhrSend: unsafeWindow.XMLHttpRequest && unsafeWindow.XMLHttpRequest.prototype.send
+        };
+    }
 
-                if (activeSession.url) {
-                    showResultToast(activeSession.adLines.length > 0,
-                                    activeSession.adLines.length);
-                }
-            }, siteProfile.quietPeriod);
-            if (unsafeWindow.document.readyState === 'complete') arm();
-            else unsafeWindow.addEventListener('load', arm, { once: true });
-        } else {
-            hookArmed = true;
-        }
-        if (DEBUG) {
-            logInfo('Hook 已安装 @', currentHost,
-                '静默期=' + siteProfile.quietPeriod + 'ms',
-                'Hook时机=' + siteProfile.hookTiming,
-                '原生HLS=' + nativeHlsSupported,
-                '已禁用HLS=' + isHostHlsDisabled(currentHost));
-        }
+    function isHookIntact() {
+        if (!hookSignatures) return false;
+        if (unsafeWindow.fetch !== hookSignatures.fetch) return false;
+        if (!unsafeWindow.XMLHttpRequest) return false;
+        const proto = unsafeWindow.XMLHttpRequest.prototype;
+        if (proto.open !== hookSignatures.xhrOpen) return false;
+        if (proto.send !== hookSignatures.xhrSend) return false;
+        return true;
+    }
+
+    function startHookWatchdog() {
+        if (watchdogTimer) return;
+        watchdogTimer = setInterval(function () {
+            if (!shouldEnableHook()) return;
+            if (Date.now() < watchdogPausedUntil) return;
+
+            if (isHookIntact()) {
+                watchdogFailCount = 0;
+                return;
+            }
+
+            watchdogFailCount++;
+
+            if (watchdogFailCount >= WATCHDOG_FAIL_THRESHOLD) {
+                watchdogPausedUntil = Date.now() + WATCHDOG_PAUSE_MS;
+                watchdogFailCount = 0;
+                return;
+            }
+
+            installHooks();
+        }, WATCHDOG_INTERVAL_MS);
+    }
+
+    function scheduleInstallHooks() {
+        installHooks();
+
+        Promise.resolve().then(function () {
+            return new Promise(function (resolve) {
+                setTimeout(resolve, 0);
+            });
+        }).then(function () {
+            if (!shouldEnableHook()) return;
+            installHooks();
+            monitorVideo();
+            startHookWatchdog();
+        }).catch(function (e) {
+            logError('scheduleInstallHooks 异常:', e);
+        });
     }
 
     // ============================================================
@@ -2115,18 +2133,7 @@
         listenChildMessages();
         setupMenus();
         setupWhitelistBridge();
-
-        if (siteProfile.hookTiming === 'domReady') {
-            if (unsafeWindow.document.readyState === 'loading') {
-                unsafeWindow.document.addEventListener('DOMContentLoaded', () => {
-                    setTimeout(doInitHooks, 0);
-                }, { once: true });
-            } else {
-                setTimeout(doInitHooks, 0);
-            }
-        } else {
-            doInitHooks();
-        }
+        doInitHooks();
     }
 
     main();

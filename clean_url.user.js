@@ -9,6 +9,8 @@
 // @run-at       document-start
 // @grant        none
 // @noframes
+// @updateURL    https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/clean_url.user.js
+// @downloadURL  https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/clean_url.user.js
 // ==/UserScript==
 
 (function () {

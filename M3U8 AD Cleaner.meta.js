@@ -21,5 +21,5 @@
 // @grant             GM_getValue
 // @grant             GM_addStyle
 // @license           MIT
-// @downloadURL       https://raw.githubusercontent.com/dxdragon/UserScripts/main/M3U8%20AD%20Cleaner.user.js
+// @downloadURL       https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/M3U8%20AD%20Cleaner.user.js
 // ==/UserScript==

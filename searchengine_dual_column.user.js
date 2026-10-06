@@ -14,8 +14,8 @@
 // @include      *://*.startpage.com/*
 // @include      *://search.brave.com/*
 // @grant        GM_addStyle
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/searchengine_dual_column.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/searchengine_dual_column.user.js
+// @updateURL    https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/searchengine_dual_column.user.js
+// @downloadURL  https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/searchengine_dual_column.user.js
 // ==/UserScript==
 
 (() => {
@@ -298,7 +298,7 @@
     }
     body.ac-two-col.startpage .w-gl > * { ${CARD_CSS} }
     body.ac-two-col.startpage #sponsored,
-    body.ac-two-col.startpage .sponsored { display: none !important; }
+    body.ac-two-col.startpage .sponsored,.w-gl-attribution,.result.h { display: none !important; }
 
     body.ac-two-col.startpage { overflow-x: hidden !important; }
     body.ac-two-col.startpage #main,

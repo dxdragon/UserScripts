@@ -14,8 +14,8 @@
 // @grant        unsafeWindow
 // @run-at       document-start
 // @license      MIT
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/bilibili_clean_link.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/bilibili_clean_link.user.js
+// @updateURL    https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/bilibili_clean_link.user.js
+// @downloadURL  https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/bilibili_clean_link.user.js
 // ==/UserScript==
 
 (function () {

@@ -8,8 +8,8 @@
 // @icon         https://nnyy.in/favicon.ico
 // @run-at       document-end
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/nnyy_fix_layout.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/nnyy_fix_layout.user.js
+// @updateURL    https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/nnyy_fix_layout.user.js
+// @downloadURL  https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/nnyy_fix_layout.user.js
 // ==/UserScript==
 
 (function () {

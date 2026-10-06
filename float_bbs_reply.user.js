@@ -17,8 +17,8 @@
 // @grant       GM_registerMenuCommand
 // @grant       GM_getValue
 // @grant       GM_setValue
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/float_bbs_reply.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/float_bbs_reply.user.js
+// @updateURL    https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/float_bbs_reply.user.js
+// @downloadURL  https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/float_bbs_reply.user.js
 // ==/UserScript==
 
 (() => {

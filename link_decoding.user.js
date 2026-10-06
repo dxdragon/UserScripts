@@ -11,8 +11,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      *
 // @run-at       document-start
-// @updateURL    https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/link_decoding.user.js
-// @downloadURL  https://raw.githubusercontent.com/dxdragon/UserScripts/raw/main/link_decoding.user.js
+// @updateURL    https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/link_decoding.user.js
+// @downloadURL  https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/link_decoding.user.js
 // ==/UserScript==
 
 (function() {

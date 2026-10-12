@@ -1572,7 +1572,7 @@
         const ads = [];
         let removedCount = 0;
         // 主要解决短区间误过滤正常片段导致音画不同步的问题，其他模式全删
-        const keepRearDisc = (playlist.mode === MODE.SHORT_INTERVAL);
+        const keepRearDisc = (playlist.mode === TS_MODE.SHORT_INTERVAL);
 
         for (let i = 0; i < playlist.header.length; i++) {
             out.push(playlist.header[i]);

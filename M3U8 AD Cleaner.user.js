@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.4.1
+// @version           1.5.0
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -294,7 +294,7 @@
         addHlsDisabledHost(currentHost);
         applyDisableHlsNow();
         refreshHlsMenu();
-        toast('success', '已禁用原生 HLS，页面即将刷新生效', 2000);
+        toast('success', '已禁用原生 HLS，页面即将刷新生效，若视频异常可恢复原生 HLS', 2000);
         tryReload();
     }
 
@@ -302,7 +302,7 @@
         removeHlsDisabledHost(currentHost);
         restoreHlsNow();
         refreshHlsMenu();
-        toast('info', '已恢复原生 HLS，页面即将刷新', 2000);
+        toast('info', '已恢复原生 HLS，页面即将刷新，因原理限制将无法过滤广告', 2000);
         tryReload();
     }
 
@@ -345,11 +345,11 @@
     // 2. 常量
     // ============================================================
     const TS_MODE = { NUMERIC: 0, FEATURE: 1, SHORT_INTERVAL: 2, NONE: 3 };
-    const MEDIA_RE = /(\d+)\.(ts|jpg|jpeg|png|fmp4|m4s|mp4)/i;
+    const TS_MODE_NAME = { 0: '数字异常', 1: '特征识别', 2: '短区间', 3: '无' };
+
     const LOG_MAX = 400;
     const MAX_M3U8_LINES = 50000;
     const MAX_M3U8_TEXT_LENGTH = 5 * 1024 * 1024;
-    const INTEGER_TOLERANCE = 0.001;
     const MIN_TS_COUNT_FOR_PATH_ANALYSIS = 8;
     const MAIN_PREFIX_RATIO_THRESHOLD = 0.7;
     const MAIN_LENGTH_RATIO_THRESHOLD = 0.7;
@@ -363,6 +363,15 @@
     const WATCHDOG_INTERVAL_MS = 500;
     const WATCHDOG_FAIL_THRESHOLD = 5;
     const WATCHDOG_PAUSE_MS = 30000;
+    const STEP_SAMPLE_COUNT = 32;
+    const NUMERIC_MAX_STEP = 10;
+
+    // 短区间策略参数
+    const SHORT_MAX_COUNT = 5;
+    const SHORT_MODE_THRESHOLD = 5;
+    const SHORT_FREQ_MAX = 5;
+    const PROTECT_FREQ = 5;
+    const PROTECT_RATIO = 0.2;
 
     const currentHost = unsafeWindow.location.hostname;
     const pendingVideoChecks = new Set();
@@ -379,22 +388,25 @@
             name: 'ryplay',
             test: /^(?:[-\w]+\.)*ryplay\d*\.com$/i,
             strategies: ['short', 'integer'],
-            options: { integerRatioNum: 1, integerRatioDen: 1 }
+            options: {
+                integerRatioNum: 1,
+                integerRatioDen: 3,
+                minDuration: 19,
+                maxDuration: 23,
+            },
         },
         {
             name: 'default',
             test: /.*/,
             strategies: ['short'],
-            options: {
-                shortMaxCount: 5, shortModeThreshold: 5, shortFreqMax: 5,
-                protectFreq: 5, protectRatio: 0.2,
-            }
-        }
+            options: {},
+        },
     ];
 
     function matchDomainRule(host) {
-        for (const rule of DOMAIN_RULES) {
-            if (rule.test.test(host)) return rule;
+        const h = host || '';
+        for (let i = 0; i < DOMAIN_RULES.length; i++) {
+            if (DOMAIN_RULES[i].test.test(h)) return DOMAIN_RULES[i];
         }
         return DOMAIN_RULES[DOMAIN_RULES.length - 1];
     }
@@ -468,8 +480,14 @@
 
     function createSession(url) {
         return {
-            url: url || '', adLines: [], headLines: [], logs: [],
-            filtered: '', changed: false
+            url: url || '',
+            adLines: [],
+            headLines: [],
+            logs: [],
+            filtered: '',
+            changed: false,
+            outcome: 'none',
+            parseError: ''
         };
     }
 
@@ -656,15 +674,15 @@
 
     function showFilterLog() {
         if (!activeSession.url) {
-            showModal('还没有检测到 m3u8 请求。<br><br>请先在页面中播放视频，然后再点击此菜单。', '提示');
+            showModal('尚未检测到 m3u8 请求。<br><br>请先在页面中播放视频，然后再点击此菜单。', '提示');
             return;
         }
         if (activeSession.adLines.length === 0) {
-            showModal('本次 m3u8 中没有检测到广告片段。<br><br>无需过滤。', '提示');
+            showModal('本次 m3u8 中未检测到广告片段。<br><br>无需过滤。', '提示');
             return;
         }
         if (activeSession.logs.length === 0) {
-            showModal('<p>本次没有任何过滤日志。</p>', '过滤日志');
+            showModal('<p>本次无任何过滤日志。</p>', '过滤日志');
             return;
         }
         const parts = [];
@@ -684,56 +702,31 @@
     // ============================================================
     // 7. 工具
     // ============================================================
-    function isM3U8File(url) {
-        if (!url) return false;
-        return /\.m3u8($|[?#])/i.test(url);
-    }
-
     function looksLikeM3U8(url) {
         if (!url || typeof url !== 'string') return false;
         return url.indexOf('m3u8') !== -1;
     }
 
-    function isM3U8Content(text) {
-        if (!text || typeof text !== 'string') return false;
-        return text.slice(0, 64).indexOf('#EXTM3U') > -1;
-    }
-
-    function isBoundary(line) {
-        return line.startsWith('#EXT-X-DISCONTINUITY') || line.startsWith('#EXT-X-ENDLIST');
-    }
-
-    function isMediaSegment(line) {
-        if (!line || line.charCodeAt(0) === 35) return false;
-        return /\.(ts|jpg|jpeg|png|fmp4|m4s|mp4)($|[?#])/i.test(line);
-    }
-
-    function parseMediaUri(uri) {
-        if (!uri) return null;
-        const m = MEDIA_RE.exec(uri);
-        if (!m) return null;
-        const extIdx = uri.indexOf('.' + m[2]);
-        if (extIdx <= 0) return null;
-        return { num: parseInt(m[1], 10), len: extIdx };
-    }
-
     function parseExtinfDuration(line) {
         if (!line || line.charCodeAt(0) !== 35) return null;
-        if (!line.startsWith('#EXTINF')) return null;
+        if (!line.startsWith('#EXTINF:')) return null;
         const v = parseFloat(line.slice(8));
         return isNaN(v) ? null : v;
     }
 
-    function isIntegerDuration(duration) {
-        if (duration === null) return false;
-        return Math.abs(duration - Math.round(duration)) < INTEGER_TOLERANCE;
-    }
-
-    function makeAbsolute(uri, baseUrl) {
-        if (!uri) return uri;
-        if (/^(https?:|blob:|data:)/i.test(uri)) return uri;
-        if (!baseUrl) return uri;
-        try { return new URL(uri, baseUrl).href; } catch (e) { return uri; }
+    function cleanUri(uri) {
+        let s = uri;
+        const schemeIdx = s.indexOf('://');
+        if (schemeIdx !== -1) {
+            const pathStart = s.indexOf('/', schemeIdx + 3);
+            s = pathStart === -1 ? '/' : s.slice(pathStart);
+        }
+        let end = s.length;
+        const q = s.indexOf('?');
+        if (q !== -1 && q < end) end = q;
+        const h = s.indexOf('#');
+        if (h !== -1 && h < end) end = h;
+        return s.slice(0, end);
     }
 
     function extractPathPrefix(uri) {
@@ -746,15 +739,6 @@
         if (end === 0) return '';
         const idx = uri.lastIndexOf('/', end - 1);
         return idx < 0 ? '' : uri.slice(0, idx + 1);
-    }
-
-    function getHostFromUrl(url) {
-        if (!url) return '';
-        try {
-            return new URL(url, unsafeWindow.location.href).hostname;
-        } catch (e) {
-            return '';
-        }
     }
 
     function stripQuery(url) {
@@ -880,533 +864,957 @@
     }
 
     // ============================================================
-    // 8. 区间构建
+    // 8. 核心过滤算法（与 filter.js 一致，纯算法，无浏览器 API 依赖）
     // ============================================================
-    function buildIntervals(lines) {
-        const intervals = [];
-        let start = -1, count = 0, integerCount = 0, totalDuration = 0;
-        const n = lines.length;
 
-        function pushInterval(end) {
-            if (start !== -1) intervals.push({ start, end, count, integerCount, totalDuration });
-        }
-        function resetInterval(newStart) {
-            start = newStart; count = 0; integerCount = 0; totalDuration = 0;
-        }
+    const AD_PATH_HIGH = [
+        'adjump',
+        'adform', 'admaster', 'adsage', 'adwords',
+        'atm.youku', 'cupid.iqiyi', 'gtimg.com/qqlive',
+        'smartclip', 'samsungads', 'lgsmartad',
+        'p1ayer', 'ssai', 'promo', 'sponsor', 'commercial'
+    ];
 
-        for (let i = 0; i < n; i++) {
-            const line = lines[i];
-            if (line.startsWith('#EXT-X-DISCONTINUITY')) {
-                pushInterval(i); resetInterval(i);
-            } else if (line.startsWith('#EXT-X-ENDLIST')) {
-                pushInterval(i); resetInterval(-1);
-            } else if (line.startsWith('#EXTINF')) {
-                if (start === -1) resetInterval(i);
-                count++;
-                const dur = parseExtinfDuration(line);
-                if (dur !== null) {
-                    totalDuration += dur;
-                    if (isIntegerDuration(dur)) integerCount++;
-                }
-            }
+    const AD_PATH_LOW = ['ad', 'ads', 'adx'];
+
+    const AD_LOW_REGEX = new RegExp(
+        '(?:^|[/_\\-\.?&=])(?:' + AD_PATH_LOW.join('|') + ')(?=[/_\\-\.?&=]|$)',
+        'i'
+    );
+
+    const AD_TAG_SOFT = [
+        '#EXT-X-KEY:METHOD=NONE',
+    ];
+
+    const HEADER_TAGS = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:',
+        '#EXT-X-TARGETDURATION:',
+        '#EXT-X-MEDIA-SEQUENCE:',
+        '#EXT-X-DISCONTINUITY-SEQUENCE:',
+        '#EXT-X-PLAYLIST-TYPE:',
+        '#EXT-X-I-FRAMES-ONLY',
+        '#EXT-X-INDEPENDENT-SEGMENTS',
+        '#EXT-X-START:',
+        '#EXT-X-SERVER-CONTROL:',
+        '#EXT-X-PART-INF:',
+    ];
+
+    function isHeaderTag(line) {
+        for (let i = 0; i < HEADER_TAGS.length; i++) {
+            if (line.startsWith(HEADER_TAGS[i])) return true;
         }
-        pushInterval(n);
-        return intervals;
+        return false;
     }
 
-    // ============================================================
-    // 9. 数字递增检测
-    // ============================================================
-    function collectNumericSeq(lines) {
-        const samples = [];
-        for (let i = 0, n = lines.length; i < n && samples.length < 32; i++) {
-            const line = lines[i];
-            if (line.charCodeAt(0) !== 35) continue;
-            if (!line.startsWith('#EXTINF')) continue;
-            const uri = lines[i + 1];
-            if (!uri) continue;
-            if (!isMediaSegment(uri)) continue;
-            const info = parseMediaUri(uri);
-            if (!info) continue;
-            samples.push({ num: info.num, len: info.len });
-        }
-        if (samples.length < 3) return { ok: false };
-
-        const diffFreq = new Map();
-        for (let i = 1; i < samples.length; i++) {
-            const d = samples[i].num - samples[i - 1].num;
-            diffFreq.set(d, (diffFreq.get(d) || 0) + 1);
-        }
-
-        let step = 0, stepCount = 0;
-        for (const [d, c] of diffFreq) {
-            if (c > stepCount || (c === stepCount && d > 0)) {
-                stepCount = c; step = d;
+    function matchAdPath(uri) {
+        if (!uri) return null;
+        for (let i = 0; i < AD_PATH_HIGH.length; i++) {
+            if (uri.indexOf(AD_PATH_HIGH[i]) !== -1) {
+                return { level: 'high', keyword: AD_PATH_HIGH[i] };
             }
         }
-        if (step <= 0 || step > 10) return { ok: false };
-        if (stepCount / (samples.length - 1) < 0.8) return { ok: false };
-
-        let jumpIdx = -1;
-        for (let i = 1; i < samples.length; i++) {
-            if (samples[i].num !== samples[i - 1].num + step) {
-                jumpIdx = i; break;
-            }
+        if (AD_LOW_REGEX.test(uri)) {
+            return { level: 'low', keyword: null };
         }
-        if (jumpIdx === -1) {
-            return { ok: true, firstNum: samples[0].num, baseLen: samples[0].len, step };
-        }
-        const beforeCount = jumpIdx - 1;
-        const afterCount = samples.length - 1 - jumpIdx;
-        if (afterCount > beforeCount) {
-            return { ok: true, firstNum: samples[jumpIdx].num, baseLen: samples[jumpIdx].len, step };
-        }
-        return { ok: true, firstNum: samples[0].num, baseLen: samples[0].len, step };
+        return null;
     }
 
-    // ============================================================
-    // 10. 路径/长度分析
-    // ============================================================
-    function analyzePathPrefixes(lines) {
-        const prefixFreq = new Map();
-        const lengthFreq = new Map();
-        let tsTotal = 0;
-
-        for (const line of lines) {
-            if (!isMediaSegment(line)) continue;
-            const prefix = extractPathPrefix(line);
-            prefixFreq.set(prefix, (prefixFreq.get(prefix) || 0) + 1);
-            lengthFreq.set(line.length, (lengthFreq.get(line.length) || 0) + 1);
-            tsTotal++;
+    function matchAdTag(line) {
+        if (!line || typeof line !== 'string') return null;
+        for (let i = 0; i < AD_TAG_SOFT.length; i++) {
+            if (line.startsWith(AD_TAG_SOFT[i])) return AD_TAG_SOFT[i];
         }
-        if (tsTotal < MIN_TS_COUNT_FOR_PATH_ANALYSIS) {
-            return { hasMinority: false, hasLengthAnomaly: false };
-        }
-        let mainPrefix = '', mainCount = 0;
-        for (const [p, c] of prefixFreq) {
-            if (c > mainCount) { mainCount = c; mainPrefix = p; }
-        }
-        const hasMinority = (mainCount / tsTotal) >= MAIN_PREFIX_RATIO_THRESHOLD && prefixFreq.size > 1;
-
-        let mainLen = 0, mainLenCount = 0;
-        for (const [l, c] of lengthFreq) {
-            if (c > mainLenCount) { mainLenCount = c; mainLen = l; }
-        }
-        const hasLengthAnomaly = (mainLenCount / tsTotal) >= MAIN_LENGTH_RATIO_THRESHOLD && lengthFreq.size > 1;
-
-        const minorityPrefixes = new Set();
-        if (hasMinority) {
-            for (const p of prefixFreq.keys()) {
-                if (p !== mainPrefix) minorityPrefixes.add(p);
-            }
-        }
-        return { hasMinority, hasLengthAnomaly, mainPrefix, mainLen, minorityPrefixes };
+        return null;
     }
 
-    // ============================================================
-    // 11. 模式检测
-    // ============================================================
-    function detectMode(lines, text) {
-        const hasAdjump = text.indexOf('/video/adjump/') !== -1;
-        const hasKeyNone = text.indexOf('#EXT-X-KEY:METHOD=NONE') !== -1;
+    // LCP/LCS 骨架探测：退化时只要骨架里还有字符且边界是数字就继续缩
+    function trySkeleton(strings) {
+        if (strings.length < 3) return { ok: false };
 
-        if (hasAdjump) return { mode: TS_MODE.FEATURE, hasAdjump: true, pathInfo: null };
-        let pathInfo = null;
-        if (hasKeyNone) {
-            pathInfo = analyzePathPrefixes(lines);
-            if (pathInfo.hasMinority || pathInfo.hasLengthAnomaly) {
-                return { mode: TS_MODE.FEATURE, hasAdjump: false, pathInfo };
-            }
+        const first = strings[0];
+        const firstLen = first.length;
+        let lcpLen = firstLen;
+        let lcsLen = firstLen;
+
+        for (let i = 1; i < strings.length; i++) {
+            const b = strings[i];
+            const bLen = b.length;
+
+            let p = 0;
+            const maxP = Math.min(lcpLen, bLen);
+            while (p < maxP && first[p] === b[p]) p++;
+            lcpLen = p;
+
+            let s = 0;
+            const maxS = Math.min(lcsLen, bLen);
+            while (s < maxS && first[firstLen - 1 - s] === b[bLen - 1 - s]) s++;
+            lcsLen = s;
         }
-        const seq = collectNumericSeq(lines);
-        if (seq.ok) {
-            return { mode: TS_MODE.NUMERIC, firstNum: seq.firstNum, baseLen: seq.baseLen, step: seq.step };
+
+        while (lcpLen + lcsLen > 0) {
+            const lcpLast = lcpLen > 0 ? first[lcpLen - 1] : '';
+            const lcsFirst = lcsLen > 0 ? first[firstLen - lcsLen] : '';
+
+            const lcpIsDigit = lcpLen > 0 && lcpLast >= '0' && lcpLast <= '9';
+            const lcsIsDigit = lcsLen > 0 && lcsFirst >= '0' && lcsFirst <= '9';
+
+            if (lcpIsDigit) lcpLen--;
+            else if (lcsIsDigit) lcsLen--;
+            else break;
         }
-        if (!pathInfo) pathInfo = analyzePathPrefixes(lines);
-        if (pathInfo.hasMinority || pathInfo.hasLengthAnomaly) {
-            return { mode: TS_MODE.FEATURE, hasAdjump: false, pathInfo };
-        }
-        return { mode: TS_MODE.SHORT_INTERVAL };
+
+        if (lcpLen + lcsLen >= firstLen) return { ok: false };
+
+        const lcp = lcpLen === 0 ? '' : first.slice(0, lcpLen);
+        const lcs = lcsLen === 0 ? '' : first.slice(firstLen - lcsLen);
+        return { ok: true, lcp, lcs };
     }
 
-    // ============================================================
-    // 12. 通用输出
-    // ============================================================
-    function emitDeletedBlocks(lines, del, reasonArr, session, defaultRule) {
-        const n = lines.length;
-        let hasAd = false;
-        let i = 0;
-        while (i < n) {
-            if (del[i]) {
-                hasAd = true;
-                const start = i;
-                while (i < n && del[i]) i++;
-                const reasons = new Set();
-                if (reasonArr) {
-                    for (let k = start; k < i; k++) {
-                        const r = reasonArr[k];
-                        if (r) reasons.add(r);
-                    }
-                }
-                const rule = reasons.size
-                    ? '规则: ' + [...reasons].join(' + ')
-                    : (defaultRule || '规则: 广告段');
-                const removed = lines.slice(start, i);
-                for (let k = 0; k < removed.length; k++) {
-                    session.adLines.push(removed[k]);
-                }
-                logFilter(session, rule, removed);
-            } else i++;
-        }
-        if (!hasAd) return lines;
-        const out = [];
-        for (let k = 0; k < n; k++) {
-            if (!del[k]) out.push(lines[k]);
-        }
-        return out;
-    }
-
-    // ============================================================
-    // 13. 处理器：FEATURE
-    // ============================================================
-    function markAdjump(lines, del, reasonArr) {
-        const n = lines.length;
-        const RULE_ADJ = '/video/adjump/ 广告段';
-        let anyAd = false;
-        let i = 0;
-        while (i < n) {
-            const line = lines[i];
-            if (line.startsWith('#EXT-X-DISCONTINUITY') &&
-                lines[i + 1] && lines[i + 1].startsWith('#EXTINF') &&
-                lines[i + 2] && lines[i + 2].indexOf('/video/adjump/') !== -1) {
-                const start = i;
-                i++;
-                while (i < n) {
-                    if (lines[i].startsWith('#EXTINF') &&
-                        lines[i + 1] && lines[i + 1].indexOf('/video/adjump/') !== -1) {
-                        i += 2; continue;
-                    }
-                    if (lines[i].startsWith('#EXT-X-DISCONTINUITY') &&
-                        lines[i + 1] && lines[i + 1].startsWith('#EXTINF') &&
-                        lines[i + 2] && lines[i + 2].indexOf('/video/adjump/') !== -1) {
-                        i++; continue;
-                    }
-                    break;
-                }
-                for (let j = start + 1; j < i; j++) {
-                    del[j] = 1; reasonArr[j] = RULE_ADJ; anyAd = true;
-                }
-                continue;
-            }
-            i++;
-        }
-        return anyAd;
-    }
-
-    function markPathAnomaly(lines, pathInfo, del, reasonArr) {
-        const intervals = buildIntervals(lines);
-        let anyAd = false;
-        const RULE_KEY = '#EXT-X-KEY:METHOD=NONE 广告段';
-        const RULE_MINORITY = '少数派路径广告段';
-        for (const it of intervals) {
-            if (it.count === 0) continue;
-            const prefixCount = new Map();
-            let totalLen = 0, uriCount = 0;
-            let hasKeyNoneInInterval = false;
-            if (it.start > 0 && lines[it.start - 1] === '#EXT-X-KEY:METHOD=NONE') {
-                hasKeyNoneInInterval = true;
-            }
-            for (let i = it.start; i < it.end; i++) {
-                const line = lines[i];
-                if (line === '#EXT-X-KEY:METHOD=NONE') hasKeyNoneInInterval = true;
-                if (!isMediaSegment(line)) continue;
-                const prefix = extractPathPrefix(line);
-                prefixCount.set(prefix, (prefixCount.get(prefix) || 0) + 1);
-                totalLen += line.length;
-                uriCount++;
-            }
-            if (uriCount === 0) continue;
-            let itPrefix = '', itPrefixCount = 0;
-            for (const [p, c] of prefixCount) {
-                if (c > itPrefixCount) { itPrefixCount = c; itPrefix = p; }
-            }
-            const hitMinority = pathInfo.hasMinority && pathInfo.minorityPrefixes.has(itPrefix);
-            const avgLen = totalLen / uriCount;
-            const hitLength = pathInfo.hasLengthAnomaly &&
-                Math.abs(avgLen - pathInfo.mainLen) / pathInfo.mainLen > LENGTH_ANOMALY_RATIO;
-            if (hitMinority || hitLength) {
-                const reasonStr = hasKeyNoneInInterval ? RULE_KEY : RULE_MINORITY;
-                let delStart = it.start;
-                if (hasKeyNoneInInterval) {
-                    if (it.start > 0 && lines[it.start - 1] === '#EXT-X-KEY:METHOD=NONE') {
-                        delStart = it.start - 1;
-                    } else {
-                        for (let i = it.start; i < it.end; i++) {
-                            if (lines[i] === '#EXT-X-KEY:METHOD=NONE') { delStart = i; break; }
-                        }
-                    }
-                }
-                for (let j = delStart; j < it.end; j++) {
-                    del[j] = 1;
-                    if (!reasonArr[j]) reasonArr[j] = reasonStr;
-                    anyAd = true;
-                }
-            }
-        }
-        return anyAd;
-    }
-
-    function filterFeature(lines, ctx, session) {
-        const n = lines.length;
-        const del = new Uint8Array(n);
-        const reasonArr = new Array(n);
-        let anyAd = false;
-        const RULE_KEY = '#EXT-X-KEY:METHOD=NONE 广告段';
-
-        if (ctx.hasAdjump) anyAd = markAdjump(lines, del, reasonArr) || anyAd;
-        if (ctx.pathInfo && (ctx.pathInfo.hasMinority || ctx.pathInfo.hasLengthAnomaly)) {
-            anyAd = markPathAnomaly(lines, ctx.pathInfo, del, reasonArr) || anyAd;
-        }
-        if (!anyAd) return lines;
-
-        for (let k = 0; k < n; k++) {
-            if (!lines[k].startsWith('#EXT-X-DISCONTINUITY')) continue;
-            if (del[k]) continue;
-            const prevDel = k > 0 && del[k - 1] === 1;
-            const nextDel = k + 1 < n && del[k + 1] === 1;
-            if (prevDel || nextDel) {
-                del[k] = 1;
-                if (k + 1 < n && lines[k + 1] === '#EXT-X-KEY:METHOD=NONE' && !del[k + 1]) {
-                    del[k + 1] = 1;
-                    if (!reasonArr[k + 1]) reasonArr[k + 1] = RULE_KEY;
-                }
-            }
-        }
-        return emitDeletedBlocks(lines, del, reasonArr, session, '规则: 广告段');
-    }
-
-    // ============================================================
-    // 14. 处理器：NUMERIC
-    // ============================================================
-    function filterNumeric(lines, ctx, session) {
-        const n = lines.length;
-        const del = new Uint8Array(n);
-        const reasonArr = new Array(n);
-        const RULE = '数字递增异常广告段';
-        let anyAd = false;
-        const step = ctx.step || 1;
-
-        let mediaSeq = 0;
-        for (let i = 0; i < n; i++) {
-            if (lines[i].startsWith('#EXT-X-MEDIA-SEQUENCE')) {
-                const m = lines[i].match(/:(\d+)/);
-                if (m) mediaSeq = parseInt(m[1], 10);
-                break;
-            }
-        }
-        const offset = ctx.firstNum - mediaSeq;
-
-        let prevNum = mediaSeq - 1;
-        let i = 0;
-        while (i < n) {
-            const line = lines[i];
-            if (line.startsWith('#EXT-X-DISCONTINUITY') && lines[i + 1] && lines[i + 2]) {
-                if (i > 0 && lines[i - 1].startsWith('#EXT-X-')) { i++; continue; }
-                const info = parseMediaUri(lines[i + 2]);
-                if (info) {
-                    const num = info.num - offset;
-                    if (num !== prevNum + step) {
-                        del[i] = 1; del[i + 1] = 1; del[i + 2] = 1;
-                        reasonArr[i] = reasonArr[i + 1] = reasonArr[i + 2] = RULE;
-                        anyAd = true; i += 3; continue;
-                    }
-                }
-                i++; continue;
-            }
-            if (line.startsWith('#EXTINF') && lines[i + 1]) {
-                const info = parseMediaUri(lines[i + 1]);
-                if (info) {
-                    const num = info.num - offset;
-                    if (num !== prevNum + step) {
-                        del[i] = 1; del[i + 1] = 1;
-                        reasonArr[i] = reasonArr[i + 1] = RULE;
-                        anyAd = true; i += 2; continue;
-                    }
-                    prevNum = num; i += 2; continue;
-                }
-            }
-            i++;
-        }
-        if (!anyAd) return lines;
-        for (let k = 0; k < n; k++) {
-            if (!lines[k].startsWith('#EXT-X-DISCONTINUITY')) continue;
-            if (del[k]) continue;
-            const prevDel = k > 0 && del[k - 1] === 1;
-            const nextDel = k + 1 < n && del[k + 1] === 1;
-            if (prevDel || nextDel) del[k] = 1;
-        }
-        return emitDeletedBlocks(lines, del, reasonArr, session, '规则: ' + RULE);
-    }
-
-    // ============================================================
-    // 15. 策略函数
-    // ============================================================
-    function strategyInteger(intervals, options) {
-        const result = new Map();
-        const { integerRatioNum = 1, integerRatioDen = 1 } = options || {};
-        for (const it of intervals) {
-            if (it.count === 0) continue;
-            const countOK = it.integerCount * integerRatioDen >= it.count * integerRatioNum;
-            if (!countOK) continue;
-            const totalOK = isIntegerDuration(it.totalDuration);
-            if (!totalOK) continue;
-            result.set(it, `整数时长广告，总时长为整数`);
-        }
-        return result;
-    }
-
-    function strategyShort(intervals, options, session) {
-        const result = new Map();
-        const {
-            shortMaxCount = 5, shortModeThreshold = 5, shortFreqMax = 5,
-            protectFreq = 5, protectRatio = 0.2,
-        } = options || {};
-        const validIntervals = intervals.filter(it => it.count > 0);
-
-        if (validIntervals.length === 0) {
-            if (session) logFilter(session, '短区间统计', '无有效区间（非空）');
-            return result;
-        }
-        const freq = new Map();
-        for (const it of validIntervals) freq.set(it.count, (freq.get(it.count) || 0) + 1);
-
-        let modeCount = 0, modeValue = 0;
-        for (const [cnt, f] of freq) {
-            if (f > modeCount || (f === modeCount && cnt > modeValue)) {
-                modeCount = f; modeValue = cnt;
-            }
-        }
-        const modeRatio = modeCount / validIntervals.length;
-        const groupDesc = [...freq.entries()]
-            .sort((a, b) => a[0] - b[0])
-            .map(([cnt, f]) => `${cnt}个×${f}次`).join(', ');
-
-        if (session) {
-            logFilter(session, '短区间统计',
-                `有效区间总数: ${validIntervals.length}\n` +
-                `分组: ${groupDesc}\n` +
-                `众数: ${modeValue}（出现 ${modeCount} 次，占比 ${(modeRatio * 100).toFixed(1)}%）`);
-        }
-
-        let short;
-        if (modeRatio >= 0.5) {
-            short = validIntervals.filter(it => {
-                if (modeValue > shortModeThreshold) return it.count <= shortMaxCount;
-                else return it.count < modeValue;
-            });
-        } else {
-            short = validIntervals.filter(it => {
-                const f = freq.get(it.count) || 0;
-                return it.count <= shortMaxCount && f <= shortFreqMax;
-            });
-            short = short.filter(it => {
-                const f = freq.get(it.count) || 0;
-                const ratio = f / validIntervals.length;
-                if (f >= protectFreq && ratio >= protectRatio) return false;
-                return true;
-            });
-        }
-        for (const it of short) result.set(it, '短区间广告');
-        return result;
-    }
-
-    const STRATEGIES = { integer: strategyInteger, short: strategyShort };
-
-    // ============================================================
-    // 16. 主调度（SHORT 模式）
-    // ============================================================
-    function filterIntervals(lines, m3u8Host, session) {
-        const intervals = buildIntervals(lines);
-        if (intervals.length === 0) return lines;
-        const rule = matchDomainRule(m3u8Host || '');
-
-        const toDelete = new Map();
-        const shortIntervals = new Set();
-
-        for (const strategyName of rule.strategies) {
-            const fn = STRATEGIES[strategyName];
-            if (!fn) continue;
-            const partial = fn(intervals, rule.options || {}, session);
-            for (const [it, reason] of partial) {
-                if (toDelete.has(it)) toDelete.set(it, toDelete.get(it) + '+' + reason);
-                else toDelete.set(it, reason);
-                if (strategyName === 'short') shortIntervals.add(it);
-            }
-        }
-        if (shortIntervals.size > SHORT_AD_MAX_INTERVALS) {
-            const kept = new Set();
-            for (const it of shortIntervals) {
-                if (it.count <= SHORT_AD_FRAGMENT_THRESHOLD) kept.add(it);
-            }
-            for (const it of shortIntervals) {
-                if (!kept.has(it)) toDelete.delete(it);
-            }
-            if (session) {
-                const dropped = shortIntervals.size - kept.size;
-                logFilter(session, '短区间数量限制',
-                    `短区间判断结果 ${shortIntervals.size} 个 > 上限 ${SHORT_AD_MAX_INTERVALS}，` +
-                    `仅删除片段数 ≤ ${SHORT_AD_FRAGMENT_THRESHOLD} 的短区间，` +
-                    `保留 ${kept.size} 个，丢弃 ${dropped} 个`);
-            }
-        }
-        if (toDelete.size === 0) return lines;
-        const del = new Uint8Array(lines.length);
-        const reasonArr = new Array(lines.length);
-        for (const [it, reason] of toDelete) {
-            for (let j = it.start; j < it.end; j++) {
-                del[j] = 1;
-                if (!reasonArr[j]) reasonArr[j] = reason;
-            }
-        }
-        return emitDeletedBlocks(lines, del, reasonArr, session, '规则: 广告段');
-    }
-
-    // ============================================================
-    // 17. 统一入口
-    // ============================================================
-    function processM3U8(text, url) {
-        if (!text || typeof text !== 'string' || text.slice(0, 64).indexOf('#EXTM3U') === -1) {
-            return { modified: text, changed: false, session: null, isMaster: false };
-        }
-        if (text.length > MAX_M3U8_TEXT_LENGTH) {
-            logError(`m3u8 文本超过 ${MAX_M3U8_TEXT_LENGTH} 字符，跳过过滤以保护性能`);
-            return { modified: text, changed: false, session: null, isMaster: false };
-        }
-        const rawLines = text.split('\n');
-        if (rawLines.length > MAX_M3U8_LINES) {
-            logError(`m3u8 行数超过 ${MAX_M3U8_LINES}，跳过过滤以保护性能`);
-            return { modified: text, changed: false, session: null, isMaster: false };
-        }
-        const session = createSession(url || '');
+    function parsePlaylist(rawLines) {
         const lines = [];
-        let hasExtinf = false;
-        let hasStreamInf = false;
-
         for (let i = 0; i < rawLines.length; i++) {
             const line = rawLines[i];
+            if (!line) continue;
+            if (line.startsWith('#') && !line.startsWith('#EXT')) continue;
+
             if (line.startsWith('#EXT-X-DISCONTINUITY')) {
                 if (lines.length > 0 && lines[lines.length - 1].startsWith('#EXT-X-DISCONTINUITY')) continue;
                 if (i + 1 < rawLines.length && rawLines[i + 1].startsWith('#EXT-X-ENDLIST')) continue;
             }
-            if (line.startsWith('#EXTINF')) { hasExtinf = true; }
-            else if (line.startsWith('#EXT-X-STREAM-INF')) hasStreamInf = true;
             lines.push(line);
         }
-        if (!hasExtinf) {
-            if (DEBUG) logInfo(hasStreamInf ? 'master playlist，跳过:' : '无 #EXTINF，跳过:', url);
-            return { modified: text, changed: false, session: null, isMaster: true };
+
+        let firstExtinf = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].startsWith('#EXTINF:')) { firstExtinf = i; break; }
         }
-        const uriTargets = extractUriTargets(lines);
+
+        if (firstExtinf === -1) {
+            return {
+                header: lines,
+                segments: [],
+                groups: [],
+                lengthIndex: new Map(),
+                hasAdTag: false,
+                hasKeyword: false,
+                empty: true,
+                mode: TS_MODE.NONE,
+                tail: [],
+            };
+        }
+
+        const header = [];
+        const segments = [];
+        const groups = [];
+        const lengthIndex = new Map();
+        const tail = [];
+        let pendingPreLines = [];
+        let groupId = 0;
+        let hasAdTag = false;
+        let hasKeyword = false;
+        let curGroup = null;
+
+        for (let i = 0; i < firstExtinf; i++) {
+            const line = lines[i];
+            if (isHeaderTag(line)) {
+                header.push(line);
+            } else {
+                if (line.startsWith('#EXT-X-DISCONTINUITY')) groupId++;
+                pendingPreLines.push(line);
+            }
+        }
+
+        function startGroup() {
+            curGroup = {
+                groupId,
+                segments: [],
+                count: 0,
+                integerCount: 0,
+                totalDuration: 0,
+                totalLength: 0,
+                prefixCount: new Map(),
+                dominantPrefix: '',
+                names: [],
+                strippedNames: [],
+            };
+        }
+
+        function endGroup() {
+            if (!curGroup) return;
+            if (curGroup.count === 0) { curGroup = null; return; }
+
+            let best = 0, bestP = '';
+            curGroup.prefixCount.forEach(function (c, p) {
+                if (c > best) { best = c; bestP = p; }
+            });
+            curGroup.dominantPrefix = bestP;
+            groups.push(curGroup);
+            curGroup = null;
+        }
+
+        let i = firstExtinf;
+        while (i < lines.length) {
+            const line = lines[i];
+
+            if (line.startsWith('#EXTINF:')) {
+                if (i + 1 >= lines.length || lines[i + 1].startsWith('#')) {
+                    for (const pl of pendingPreLines) tail.push(pl);
+                    pendingPreLines = [];
+                    tail.push(line);
+                    i++;
+                    continue;
+                }
+
+                if (!curGroup) startGroup();
+
+                const extinfLine = line;
+                const mediaLine = lines[i + 1];
+                const duration = parseExtinfDuration(extinfLine);
+                const path = cleanUri(mediaLine);
+                const prefix = extractPathPrefix(mediaLine);
+                const len = mediaLine.length;
+                const isIntDur = duration !== null && Number.isInteger(duration);
+
+                const lastSlash = path.lastIndexOf('/');
+                const name = lastSlash < 0 ? path : path.slice(lastSlash + 1);
+                const strippedName = name.replace(/\.[a-z0-9]{1,8}$/i, '');
+
+                const seg = {
+                    preLines: pendingPreLines,
+                    extinfLine,
+                    mediaLine,
+                    path,
+                    prefix,
+                    num: null,
+                    duration,
+                    isIntegerDuration: isIntDur,
+                    groupId,
+                    removed: false,
+                };
+
+                segments.push(seg);
+                curGroup.segments.push(seg);
+                curGroup.count++;
+                if (isIntDur) curGroup.integerCount++;
+                if (duration !== null) curGroup.totalDuration += duration;
+                curGroup.totalLength += len;
+                curGroup.prefixCount.set(prefix, (curGroup.prefixCount.get(prefix) || 0) + 1);
+
+                curGroup.names.push(name);
+                curGroup.strippedNames.push(strippedName);
+
+                lengthIndex.set(len, (lengthIndex.get(len) || 0) + 1);
+
+                if (matchAdPath(mediaLine)) {
+                    hasKeyword = true;
+                    seg.removed = true;
+                }
+
+                pendingPreLines = [];
+                i += 2;
+                continue;
+            }
+
+            if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+                endGroup();
+                groupId++;
+                pendingPreLines.push(line);
+                i++;
+                continue;
+            }
+
+            if (line.startsWith('#EXT-X-ENDLIST')) {
+                endGroup();
+                for (const pl of pendingPreLines) tail.push(pl);
+                pendingPreLines = [];
+                while (i < lines.length) { tail.push(lines[i]); i++; }
+                break;
+            }
+
+            if (line.startsWith('#')) {
+                if (matchAdTag(line)) hasAdTag = true;
+                pendingPreLines.push(line);
+                i++;
+                continue;
+            }
+
+            i++;
+        }
+
+        endGroup();
+        for (const pl of pendingPreLines) tail.push(pl);
+
+        return {
+            header,
+            segments,
+            groups,
+            lengthIndex,
+            hasAdTag,
+            hasKeyword,
+            empty: false,
+            tail,
+        };
+    }
+
+    // 按组提取数字 + 按 LCP/LCS 分组共享基准值
+    function extractNumbers(groups) {
+        let numCount = 0;
+        const first32Nums = [];
+        const limit = STEP_SAMPLE_COUNT;
+
+        const groupData = [];
+        const baseMap = new Map();
+
+        for (let g = 0; g < groups.length; g++) {
+            const grp = groups[g];
+            if (grp.count < 3) { groupData.push(null); continue; }
+
+            let version, lcp, lcs;
+
+            const rA = trySkeleton(grp.strippedNames);
+            if (rA.ok) {
+                version = 'A'; lcp = rA.lcp; lcs = rA.lcs;
+            } else {
+                const rB = trySkeleton(grp.names);
+                if (!rB.ok) { groupData.push(null); continue; }
+                version = 'B'; lcp = rB.lcp; lcs = rB.lcs;
+            }
+
+            const useStripped = (version === 'A');
+            const source = useStripped ? grp.strippedNames : grp.names;
+            const nums = [];
+            let allValid = true;
+
+            const lcpLen = lcp.length;
+            const lcsLen = lcs.length;
+
+            for (let i = 0; i < source.length; i++) {
+                const s = source[i];
+                if (!s.startsWith(lcp) || (lcs && !s.endsWith(lcs))) {
+                    allValid = false; break;
+                }
+                const mid = s.slice(lcpLen, s.length - lcsLen);
+                if (!/^\d+$/.test(mid)) { allValid = false; break; }
+                nums.push(parseInt(mid, 10));
+            }
+
+            if (!allValid) { groupData.push(null); continue; }
+
+            const key = version + '\u0001' + lcp + '\u0001' + lcs;
+            groupData.push({ nums, segs: grp.segments, key });
+        }
+
+        for (let g = 0; g < groupData.length; g++) {
+            const d = groupData[g];
+            if (!d) continue;
+            if (!baseMap.has(d.key)) {
+                baseMap.set(d.key, d.nums[0]);
+            }
+        }
+
+        for (let g = 0; g < groupData.length; g++) {
+            const d = groupData[g];
+            if (!d) continue;
+            const base = baseMap.get(d.key);
+            for (let i = 0; i < d.nums.length; i++) {
+                const adjusted = d.nums[i] - base;
+                d.segs[i].num = adjusted;
+                numCount++;
+                if (first32Nums.length < limit) first32Nums.push(adjusted);
+            }
+        }
+
+        return { numCount, first32Nums };
+    }
+
+    function computeStep(nums) {
+        const limit = Math.min(nums.length, STEP_SAMPLE_COUNT);
+        if (limit < 2) return 0;
+
+        const diffFreq = new Map();
+        for (let i = 1; i < limit; i++) {
+            const d = nums[i] - nums[i - 1];
+            diffFreq.set(d, (diffFreq.get(d) || 0) + 1);
+        }
+
+        let step = 0;
+        let bestCount = 0;
+        diffFreq.forEach(function (c, d) {
+            if (c > bestCount || (c === bestCount && d > 0)) {
+                bestCount = c;
+                step = d;
+            }
+        });
+
+        if (step <= 0 || step > NUMERIC_MAX_STEP) return 0;
+        return step;
+    }
+
+    function analyzePathPrefixes(playlist) {
+        const groups = playlist.groups;
+        const lengthIndex = playlist.lengthIndex;
+
+        const prefixTotal = new Map();
+        let total = 0;
+        for (let i = 0; i < groups.length; i++) {
+            const grp = groups[i];
+            grp.prefixCount.forEach(function (c, p) {
+                prefixTotal.set(p, (prefixTotal.get(p) || 0) + c);
+                total += c;
+            });
+        }
+
+        if (total < MIN_TS_COUNT_FOR_PATH_ANALYSIS) {
+            return { hasMinority: false, hasLengthAnomaly: false };
+        }
+
+        let mainPrefix = '', mainCount = 0;
+        prefixTotal.forEach(function (c, p) {
+            if (c > mainCount) { mainCount = c; mainPrefix = p; }
+        });
+        const hasMinority = (mainCount / total) >= MAIN_PREFIX_RATIO_THRESHOLD && prefixTotal.size > 1;
+
+        let mainLen = 0, mainLenCount = 0;
+        lengthIndex.forEach(function (c, l) {
+            if (c > mainLenCount) { mainLenCount = c; mainLen = l; }
+        });
+        const hasLengthAnomaly = (mainLenCount / total) >= MAIN_LENGTH_RATIO_THRESHOLD && lengthIndex.size > 1;
+
+        return { hasMinority, hasLengthAnomaly, mainPrefix, mainLen, prefixTotal };
+    }
+
+    function detectMode(playlist, numStats) {
+        const pathInfo = analyzePathPrefixes(playlist);
+
+        if (playlist.hasAdTag && (pathInfo.hasMinority || pathInfo.hasLengthAnomaly)) {
+            return { mode: TS_MODE.FEATURE, pathInfo };
+        }
+
+        if (numStats.numCount >= 3) {
+            const step = computeStep(numStats.first32Nums);
+            if (step > 0) {
+                return { mode: TS_MODE.NUMERIC, step };
+            }
+        }
+
+        if (pathInfo.hasMinority || pathInfo.hasLengthAnomaly) {
+            return { mode: TS_MODE.FEATURE, pathInfo };
+        }
+
+        return { mode: TS_MODE.SHORT_INTERVAL };
+    }
+
+    function filterFeature(playlist, ctx) {
+        const rules = new Set();
+        const pathInfo = ctx.pathInfo;
+        if (!pathInfo || (!pathInfo.hasMinority && !pathInfo.hasLengthAnomaly)) {
+            return [];
+        }
+
+        const groups = playlist.groups;
+
+        for (let g = 0; g < groups.length; g++) {
+            const grp = groups[g];
+            if (grp.count === 0) continue;
+
+            let hasTagInGroup = false;
+            for (let i = 0; i < grp.segments.length; i++) {
+                const pre = grp.segments[i].preLines;
+                for (let j = 0; j < pre.length; j++) {
+                    if (matchAdTag(pre[j])) { hasTagInGroup = true; break; }
+                }
+                if (hasTagInGroup) break;
+            }
+
+            if (grp.prefixCount.size === 1) {
+                const hitMinority = pathInfo.hasMinority && grp.dominantPrefix !== pathInfo.mainPrefix;
+                const avgLen = grp.totalLength / grp.count;
+                const hitLength = pathInfo.hasLengthAnomaly &&
+                    Math.abs(avgLen - pathInfo.mainLen) / pathInfo.mainLen > LENGTH_ANOMALY_RATIO;
+
+                if (hitMinority || hitLength) {
+                    let reason;
+                    if (hasTagInGroup) reason = '标签标识';
+                    else if (hitMinority) reason = '少数派';
+                    else reason = '长度异常';
+
+                    for (let i = 0; i < grp.segments.length; i++) {
+                        grp.segments[i].removed = true;
+                    }
+                    rules.add(reason);
+                }
+            } else {
+                const groupMain = grp.dominantPrefix;
+                let removedAny = false;
+                for (let i = 0; i < grp.segments.length; i++) {
+                    const seg = grp.segments[i];
+                    if (seg.removed) continue;
+                    if (seg.prefix !== groupMain) {
+                        seg.removed = true;
+                        removedAny = true;
+                    }
+                }
+                if (removedAny) rules.add('少数派');
+            }
+        }
+
+        return Array.from(rules);
+    }
+
+    function filterNumeric(playlist, step) {
+        const segments = playlist.segments;
+        const n = segments.length;
+
+        if (!step || step <= 0 || n < 3) return [];
+
+        let firstIdx = -1;
+        for (let i = 0; i < n; i++) {
+            if (segments[i].num !== null) { firstIdx = i; break; }
+        }
+        if (firstIdx < 0) return [];
+
+        function hasDisc(seg) {
+            for (let j = 0; j < seg.preLines.length; j++) {
+                if (seg.preLines[j].startsWith('#EXT-X-DISCONTINUITY')) return true;
+            }
+            return false;
+        }
+
+        let prevNumA = segments[firstIdx].num;
+        let countA = 0;
+        let posB = -1;
+        let prevNumB = 0;
+        let countB = 0;
+        let active = 'A';
+
+        for (let i = firstIdx + 1; i < n; i++) {
+            const seg = segments[i];
+            if (seg.num === null) continue;
+            const cur = seg.num;
+
+            if (active === 'A') {
+                if (cur === prevNumA + step) {
+                    countA++;
+                    prevNumA = cur;
+                } else if (hasDisc(seg)) {
+                    if (posB < 0) {
+                        posB = i;
+                        prevNumB = cur;
+                        countB = 0;
+                    } else if (cur === prevNumB + step) {
+                        countB++;
+                        prevNumB = cur;
+                    }
+                    active = 'B';
+                }
+            } else {
+                if (cur === prevNumB + step) {
+                    countB++;
+                    prevNumB = cur;
+                } else if (hasDisc(seg)) {
+                    if (cur === prevNumA + step) {
+                        countA++;
+                        prevNumA = cur;
+                    }
+                    active = 'A';
+                }
+            }
+        }
+
+        let pos, firstNum;
+        if (countA >= countB) {
+            pos = firstIdx;
+            firstNum = segments[firstIdx].num;
+        } else {
+            pos = posB;
+            firstNum = segments[posB].num;
+        }
+
+        let prevNum = firstNum;
+        let seenPos = false;
+        let removedAny = false;
+
+        for (let i = 0; i < n; i++) {
+            const seg = segments[i];
+
+            if (i < pos) { seg.removed = true; removedAny = true; continue; }
+            if (!seenPos) { seenPos = true; prevNum = firstNum; continue; }
+
+            if (seg.num !== null && seg.num === prevNum + step) {
+                prevNum = seg.num;
+            } else {
+                seg.removed = true;
+                removedAny = true;
+            }
+        }
+
+        return removedAny ? ['数字异常'] : [];
+    }
+
+    function strategyInteger(intervals, options) {
+        const result = new Set();
+        const integerRatioNum = (options && options.integerRatioNum) || 1;
+        const integerRatioDen = (options && options.integerRatioDen) || 1;
+        const minDuration = (options && options.minDuration !== undefined) ? options.minDuration : null;
+        const maxDuration = (options && options.maxDuration !== undefined) ? options.maxDuration : null;
+
+        for (let i = 0; i < intervals.length; i++) {
+            const it = intervals[i];
+            if (it.count === 0) continue;
+            if (it.integerCount * integerRatioDen < it.count * integerRatioNum) continue;
+            if (!Number.isInteger(it.totalDuration)) continue;
+            if (minDuration !== null && it.totalDuration < minDuration) continue;
+            if (maxDuration !== null && it.totalDuration > maxDuration) continue;
+            result.add(it);
+        }
+        return result;
+    }
+
+    function strategyShort(intervals) {
+        const result = new Set();
+        const valid = [];
+        for (let i = 0; i < intervals.length; i++) {
+            if (intervals[i].count > 0) valid.push(intervals[i]);
+        }
+        if (valid.length === 0) return result;
+
+        const freq = new Map();
+        for (let i = 0; i < valid.length; i++) {
+            const c = valid[i].count;
+            freq.set(c, (freq.get(c) || 0) + 1);
+        }
+
+        let modeCount = 0, modeValue = 0;
+        freq.forEach(function (f, cnt) {
+            if (f > modeCount || (f === modeCount && cnt > modeValue)) {
+                modeCount = f;
+                modeValue = cnt;
+            }
+        });
+        const modeRatio = modeCount / valid.length;
+
+        let short;
+        if (modeRatio >= 0.5) {
+            short = valid.filter(function (it) {
+                if (modeValue > SHORT_MODE_THRESHOLD) {
+                    return it.count <= SHORT_MAX_COUNT;
+                }
+                return it.count < modeValue;
+            });
+        } else {
+            short = valid.filter(function (it) {
+                const f = freq.get(it.count) || 0;
+                return it.count <= SHORT_MAX_COUNT && f <= SHORT_FREQ_MAX;
+            });
+            short = short.filter(function (it) {
+                const f = freq.get(it.count) || 0;
+                const ratio = f / valid.length;
+                if (f >= PROTECT_FREQ && ratio >= PROTECT_RATIO) return false;
+                return true;
+            });
+        }
+
+        for (let i = 0; i < short.length; i++) result.add(short[i]);
+        return result;
+    }
+
+    function filterShortInterval(playlist, host) {
+        const rule = matchDomainRule(host);
+        const groups = playlist.groups;
+        if (groups.length === 0) return [];
+
+        const intervals = groups.map(function (grp) {
+            return {
+                group: grp,
+                count: grp.count,
+                integerCount: grp.integerCount,
+                totalDuration: grp.totalDuration,
+            };
+        });
+
+        const toDelete = new Set();
+        const rules = new Set();
+
+        for (let i = 0; i < rule.strategies.length; i++) {
+            const name = rule.strategies[i];
+            let partial;
+            if (name === 'short') {
+                partial = strategyShort(intervals);
+                if (partial.size > 0) rules.add('短区间');
+            } else if (name === 'integer') {
+                partial = strategyInteger(intervals, rule.options);
+                if (partial.size > 0) rules.add('整数时长');
+            } else continue;
+            partial.forEach(function (it) { toDelete.add(it); });
+        }
+
+        if (toDelete.size > SHORT_AD_MAX_INTERVALS) {
+            const kept = new Set();
+            toDelete.forEach(function (it) {
+                if (it.count <= SHORT_AD_FRAGMENT_THRESHOLD) kept.add(it);
+            });
+            toDelete.clear();
+            kept.forEach(function (it) { toDelete.add(it); });
+        }
+
+        toDelete.forEach(function (it) {
+            for (let i = 0; i < it.group.segments.length; i++) {
+                it.group.segments[i].removed = true;
+            }
+        });
+
+        return Array.from(rules);
+    }
+
+    function serialize(playlist) {
+        const out = [];
+        const ads = [];
+        let removedCount = 0;
+        // 主要解决短区间误过滤正常片段导致音画不同步的问题，其他模式全删
+        const keepRearDisc = (playlist.mode === MODE.SHORT_INTERVAL);
+
+        for (let i = 0; i < playlist.header.length; i++) {
+            out.push(playlist.header[i]);
+        }
+
+        let prevWasKept = null;
+
+        for (let i = 0; i < playlist.segments.length; i++) {
+            const seg = playlist.segments[i];
+
+            if (seg.removed) {
+                for (let j = 0; j < seg.preLines.length; j++) {
+                    ads.push(seg.preLines[j]);
+                    removedCount++;
+                }
+                ads.push(seg.extinfLine);
+                removedCount++;
+                ads.push(seg.mediaLine);
+                removedCount++;
+                prevWasKept = false;
+                continue;
+            }
+
+            let discCount = 0;
+            for (let j = 0; j < seg.preLines.length; j++) {
+                const pl = seg.preLines[j];
+                if (pl.startsWith('#EXT-X-DISCONTINUITY')) {
+                    discCount++;
+                } else {
+                    out.push(pl);
+                }
+            }
+
+            if (discCount > 0) {
+                if (prevWasKept === false && !keepRearDisc) {
+                    for (let k = 0; k < discCount; k++) ads.push('#EXT-X-DISCONTINUITY');
+                    removedCount += discCount;
+                } else {
+                    out.push('#EXT-X-DISCONTINUITY');
+                    removedCount += discCount - 1;
+                    for (let k = 1; k < discCount; k++) ads.push('#EXT-X-DISCONTINUITY');
+                }
+            }
+
+            out.push(seg.extinfLine);
+            out.push(seg.mediaLine);
+            prevWasKept = true;
+        }
+
+        for (let i = 0; i < playlist.tail.length; i++) {
+            out.push(playlist.tail[i]);
+        }
+
+        return { lines: out, ads: ads, removedCount: removedCount };
+    }
+
+    function filterM3U8(text, url) {
+        const stats = {
+            originalLines: 0,
+            removedLines: 0,
+            mode: TS_MODE.NONE,
+            modeName: TS_MODE_NAME[TS_MODE.NONE],
+            ruleName: '',
+            rules: [],
+            error: null,
+            master: false,
+        };
+
+        const emptyResult = function (mod, changed) {
+            return { modified: mod, changed, stats, headLines: [], ads: [] };
+        };
+
+        if (!text || typeof text !== 'string' || text.length === 0) {
+            stats.error = 'empty';
+            return emptyResult(text, false);
+        }
+
+        const trimmed = text.replace(/^\uFEFF/, '').replace(/^\s+/, '');
+
+        if (trimmed.length === 0) {
+            stats.error = 'empty';
+            return emptyResult(text, false);
+        }
+
+        if (trimmed.charCodeAt(0) === 0x3C) {
+            stats.error = 'html';
+            return emptyResult(text, false);
+        }
+
+        if (trimmed.slice(0, 64).indexOf('#EXTM3U') === -1) {
+            stats.error = 'not-m3u8';
+            return emptyResult(text, false);
+        }
+
+        if (text.indexOf('#EXT-X-STREAM-INF') !== -1) {
+            stats.master = true;
+            return emptyResult(text, false);
+        }
+
+        let rawLines;
+        try { rawLines = text.split('\n'); }
+        catch (e) { stats.error = 'split failed'; return emptyResult(text, false); }
+
+        stats.originalLines = rawLines.length;
+
+        if (rawLines.length > MAX_M3U8_LINES) {
+            stats.error = 'too many lines';
+            return emptyResult(text, false);
+        }
+
+        let playlist;
+        try { playlist = parsePlaylist(rawLines); }
+        catch (e) { stats.error = String(e); return emptyResult(text, false); }
+
+        if (playlist.empty) {
+            stats.error = 'empty-playlist';
+            return emptyResult(text, false);
+        }
+
+        if (playlist.hasKeyword) {
+            playlist.mode = TS_MODE.FEATURE;
+            stats.mode = playlist.mode;
+            stats.modeName = TS_MODE_NAME[playlist.mode];
+            stats.rules = ['关键词'];
+
+            const ser = serialize(playlist);
+            stats.removedLines = ser.removedCount;
+
+            const headLines = playlist.header.slice();
+            if (headLines.length === 0 || headLines[0] !== '#EXTM3U') headLines.unshift('#EXTM3U');
+
+            if (ser.removedCount === 0) {
+                return { modified: text, changed: false, stats, headLines, ads: [] };
+            }
+            return {
+                modified: ser.lines.join('\n'),
+                changed: true, stats, headLines, ads: ser.ads
+            };
+        }
+
+        let numStats = { numCount: 0, first32Nums: [] };
+        try { numStats = extractNumbers(playlist.groups); }
+        catch (e) { /* 不致命 */ }
+
+        const ctx = detectMode(playlist, numStats);
+        playlist.mode = ctx.mode;
+        stats.mode = playlist.mode;
+        stats.modeName = TS_MODE_NAME[playlist.mode] || TS_MODE_NAME[TS_MODE.NONE];
+
+        let rules;
+        try {
+            switch (ctx.mode) {
+                case TS_MODE.FEATURE:
+                    rules = filterFeature(playlist, ctx);
+                    break;
+                case TS_MODE.NUMERIC:
+                    rules = filterNumeric(playlist, ctx.step);
+                    break;
+                case TS_MODE.SHORT_INTERVAL: {
+                    let host = '';
+                    try { host = new URL(url).hostname; } catch (e) {}
+                    stats.ruleName = matchDomainRule(host).name;
+                    rules = filterShortInterval(playlist, host);
+                    break;
+                }
+                default:
+                    rules = [];
+            }
+        } catch (e) {
+            stats.error = String(e);
+            return emptyResult(text, false);
+        }
+
+        stats.rules = rules || [];
+
+        const ser = serialize(playlist);
+        stats.removedLines = ser.removedCount;
+
+        const headLines = playlist.header.slice();
+        if (headLines.length === 0 || headLines[0] !== '#EXTM3U') headLines.unshift('#EXTM3U');
+
+        if (ser.removedCount === 0) {
+            return { modified: text, changed: false, stats, headLines, ads: [] };
+        }
+        return {
+            modified: ser.lines.join('\n'),
+            changed: true, stats, headLines, ads: ser.ads
+        };
+    }
+
+    // ============================================================
+    // 8.1 统一入口：调用 filterM3U8 并适配脚本 session 结构
+    // ============================================================
+    function processM3U8(text, url) {
+        if (!text || typeof text !== 'string') {
+            return { modified: text, changed: false, session: null, isMaster: false, error: 'empty' };
+        }
+
+        if (text.length > MAX_M3U8_TEXT_LENGTH) {
+            logError(`m3u8 文本超过 ${MAX_M3U8_TEXT_LENGTH} 字符，跳过过滤以保护性能`);
+            return { modified: text, changed: false, session: null, isMaster: false, error: null };
+        }
+
+        let result;
+        try {
+            result = filterM3U8(text, url);
+        } catch (e) {
+            logError('filterM3U8 异常:', e);
+            return { modified: text, changed: false, session: null, isMaster: false, error: String(e) };
+        }
+
+        if (result.stats.master) {
+            if (DEBUG) logInfo('master playlist，跳过:', url);
+            return { modified: text, changed: false, session: null, isMaster: true, error: null };
+        }
+
+        if (result.stats.error) {
+            return {
+                modified: text, changed: false, session: null, isMaster: false,
+                error: result.stats.error
+            };
+        }
+
+        // 正常流程：构造 session
+        const session = createSession(url || '');
+        session.filtered = result.modified;
+        session.changed = result.changed;
+        session.headLines = result.headLines;
+        session.adLines = result.ads || [];
+        session.outcome = result.changed ? 'filtered' : 'no-ads';
+        session.parseError = '';
+
+        if (result.changed && result.stats.removedLines > 0) {
+            const ruleText = (result.stats.rules && result.stats.rules.length)
+                ? '规则: ' + result.stats.rules.join('+')
+                : '规则: 广告段';
+            logPush(session, ruleText, result.ads);
+        }
+
+        // 记录 URI 目标（extractUriTargets 兼容）
+        const rawLines = text.split('\n');
+        const uriTargets = extractUriTargets(rawLines);
         uriHits.clear();
         pendingUriTargets = uriTargets;
         if (uriTargetTimer) { clearTimeout(uriTargetTimer); uriTargetTimer = null; }
@@ -1421,83 +1829,8 @@
         } else {
             requestRecordEnabled = false;
         }
-        const m3u8Host = getHostFromUrl(url);
-        const ctx = detectMode(lines, text);
-        logInfo('模式:', ctx.mode);
-        let out;
-        switch (ctx.mode) {
-            case TS_MODE.FEATURE:        out = filterFeature(lines, ctx, session); break;
-            case TS_MODE.NUMERIC:        out = filterNumeric(lines, ctx, session); break;
-            case TS_MODE.SHORT_INTERVAL: out = filterIntervals(lines, m3u8Host, session); break;
-            case TS_MODE.NONE:
-            default:                     out = lines;
-        }
-        const finalLines = session.changed ? out : lines;
 
-        const headLines = [];
-        for (let i = 0; i < finalLines.length; i++) {
-            if (finalLines[i].startsWith('#EXTINF')) break;
-            headLines.push(finalLines[i]);
-        }
-        if (headLines.length === 0 || headLines[0] !== '#EXTM3U') {
-            headLines.unshift('#EXTM3U');
-        }
-        session.headLines = headLines;
-
-        if (!session.changed && lines.length === rawLines.length) {
-            session.filtered = text;
-            return { modified: text, changed: false, session, isMaster: false };
-        }
-        const resultText = finalLines.join('\n');
-        session.filtered = resultText;
-        return { modified: resultText, changed: session.changed, session, isMaster: false };
-    }
-
-    // ============================================================
-    // 18. 导出
-    // ============================================================
-    function downloadBlob(content, filename, mime) {
-        const blob = new Blob([content], { type: mime || 'application/octet-stream' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        (document.body || document.documentElement).appendChild(a);
-        a.click();
-        setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 200);
-    }
-
-    function exportAdM3U8() {
-        if (!activeSession.url) { toast('info', '还没有检测到 m3u8，请先播放视频'); return; }
-        if (activeSession.adLines.length === 0) { toast('info', '本次未发现广告，无需导出'); return; }
-        const resultLines = [];
-        if (activeSession.headLines.length > 0) resultLines.push(...activeSession.headLines);
-        else { resultLines.push('#EXTM3U'); resultLines.push('#EXT-X-TARGETDURATION:10'); }
-        if (resultLines[0] !== '#EXTM3U') resultLines.unshift('#EXTM3U');
-        for (const line of activeSession.adLines) {
-            if (!line) continue;
-            if (line.startsWith('#')) resultLines.push(absolutizeAttrUri(line, activeSession.url));
-            else resultLines.push(resolveUri(line, activeSession.url));
-        }
-        if (!resultLines.includes('#EXT-X-ENDLIST')) resultLines.push('#EXT-X-ENDLIST');
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        downloadBlob(resultLines.join('\n'), `ad_segments_${stamp}.m3u8`, 'application/vnd.apple.mpegurl');
-        toast('success', `广告片段已导出（${activeSession.adLines.length} 行）`);
-    }
-
-    function exportCleanM3U8() {
-        if (!activeSession.url) { toast('info', '还没有检测到 m3u8，请先播放视频'); return; }
-        if (!activeSession.filtered) { toast('info', '还没有可导出的 m3u8 内容'); return; }
-        const lines = activeSession.filtered.split('\n');
-        const out = [];
-        for (const line of lines) {
-            if (!line) { out.push(line); continue; }
-            if (line.startsWith('#')) out.push(absolutizeAttrUri(line, activeSession.url));
-            else out.push(resolveUri(line, activeSession.url));
-        }
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        downloadBlob(out.join('\n'), `clean_${stamp}.m3u8`, 'application/vnd.apple.mpegurl');
-        toast('success', '无广告 m3u8 已导出');
+        return { modified: result.modified, changed: result.changed, session, isMaster: false, error: null };
     }
 
     // ============================================================
@@ -1505,42 +1838,175 @@
     // ============================================================
     function updateActiveSession(newSession) {
         if (!newSession) return;
+
+        // pending：替换非 pending 的旧 session
+        // （视频重新加载时能立即清旧数据；连续重复请求不刷屏）
+        if (newSession.outcome === 'pending') {
+            if (activeSession.outcome !== 'pending') {
+                activeSession = newSession;
+            }
+            return;
+        }
+
+        // 非 pending 且 URL 变化：无条件替换
+        if (newSession.url && newSession.url !== activeSession.url) {
+            activeSession = newSession;
+            return;
+        }
+
+        // 非 pending 且同 URL：有广告优先
         const hasNewAds = newSession.adLines && newSession.adLines.length > 0;
         const hasOldAds = activeSession && activeSession.adLines && activeSession.adLines.length > 0;
         if (hasNewAds || !hasOldAds) activeSession = newSession;
     }
 
-    function showResultToast(hadAds, adCount) {
-        if (!showToastFlag) return;
-        if (unsafeWindow.self !== unsafeWindow.top) return;
-        const now = Date.now();
-        const withinWindow = now - lastToastTime < STATUS_DEDUP_WINDOW_MS;
-        if (withinWindow) {
-            if (lastToastHadAds || !hadAds) return;
-            if (lastNoAdToastEl) { removeToastEl(lastNoAdToastEl); lastNoAdToastEl = null; }
-        }
-        if (hadAds) {
-            if (pendingToastTimer) { clearTimeout(pendingToastTimer); pendingToastTimer = null; }
-            lastToastTime = now; lastToastHadAds = true;
-            toast('success', `已过滤切片广告，可导出 ${adCount} 行广告片段`);
+    function notifyM3U8Pending(url) {
+        if (unsafeWindow.self !== unsafeWindow.top) {
+            try {
+                unsafeWindow.top.postMessage({
+                    __m3u8ar: true, type: 'pending', url: url
+                }, '*');
+            } catch (e) {}
             return;
         }
+
+        // 清除去重状态，让随后到达的响应能正常更新
+        lastProcessedUrl = '';
+        lastProcessedTime = 0;
+
+        const s = createSession(url);
+        s.outcome = 'pending';
+        updateActiveSession(s);
+        refreshHlsMenu();
+        updateFilterTip();
+    }
+
+    // 根据 session 生成弹窗内容
+    function buildStatusToast(session) {
+        const outcome = session.outcome || 'none';
+
+        if (outcome === 'pending') return null;
+
+        if (outcome === 'filtered') {
+            return {
+                type: 'success',
+                text: `已过滤切片广告，可导出 ${session.adLines.length} 行广告片段`,
+                duration: 3000
+            };
+        }
+
+        if (outcome === 'no-ads') {
+            return {
+                type: 'info',
+                text: '已检查 m3u8，未发现广告',
+                duration: 3000
+            };
+        }
+
+        if (outcome === 'invalid') {
+            const pe = session.parseError;
+            let text;
+            if (pe === 'empty') text = 'm3u8 响应为空';
+            else if (pe === 'html') text = 'm3u8 响应是 HTML（错误页或重定向）';
+            else if (pe === 'not-m3u8') text = 'm3u8 响应不是 m3u8 内容';
+            else if (pe === 'empty-playlist') text = 'm3u8 无分片内容';
+            else text = 'm3u8 响应无效';
+            return { type: 'warning', text, duration: 4000 };
+        }
+
+        if (outcome === 'parse-error') {
+            return {
+                type: 'error',
+                text: 'm3u8 解析失败',
+                duration: 4000
+            };
+        }
+
+        return null;
+    }
+
+    function showResultToast(session) {
+        if (!showToastFlag) return;
+        if (unsafeWindow.self !== unsafeWindow.top) return;
+
+        const info = buildStatusToast(session);
+        if (!info) return;
+
+        const now = Date.now();
+        const hasAds = session.outcome === 'filtered';
+
+        if (hasAds) {
+            if (pendingToastTimer) { clearTimeout(pendingToastTimer); pendingToastTimer = null; }
+            lastToastTime = now;
+            lastToastHadAds = true;
+            toast(info.type, info.text, info.duration);
+            return;
+        }
+
+        // 非广告类：短窗口去重 + 延迟，避免和广告提示抢屏
+        if (now - lastToastTime < STATUS_DEDUP_WINDOW_MS && lastToastHadAds) return;
+
         if (pendingToastTimer) clearTimeout(pendingToastTimer);
         pendingToastTimer = setTimeout(() => {
             pendingToastTimer = null;
             const t = Date.now();
             if (t - lastToastTime < STATUS_DEDUP_WINDOW_MS && lastToastHadAds) return;
-            lastToastTime = t; lastToastHadAds = false;
-            lastNoAdToastEl = toast('info', '已检查 m3u8，未发现广告');
+            lastToastTime = t;
+            lastToastHadAds = false;
+            lastNoAdToastEl = toast(info.type, info.text, info.duration);
         }, TOAST_DELAY_NO_AD_MS);
     }
 
     function onM3U8Processed(result, url) {
         if (!result || result.isMaster) return;
+
+        // 响应层面错误（empty / html / not-m3u8 / empty-playlist）
+        // 或解析错误（too many lines / split failed / ...）
+        if (result.error) {
+            let outcome;
+            if (result.error === 'empty' ||
+                result.error === 'html' ||
+                result.error === 'not-m3u8' ||
+                result.error === 'empty-playlist') {
+                outcome = 'invalid';
+            } else {
+                outcome = 'parse-error';
+            }
+
+            const s = createSession(url || '');
+            s.outcome = outcome;
+            s.parseError = result.error;
+            s.filtered = '';
+            s.changed = false;
+
+            const key = url || '';
+            const now = Date.now();
+            if (key && key === lastProcessedUrl && now - lastProcessedTime < STATUS_DEDUP_WINDOW_MS) return;
+            lastProcessedUrl = key;
+            lastProcessedTime = now;
+
+            if (unsafeWindow.self !== unsafeWindow.top) {
+                try {
+                    unsafeWindow.top.postMessage({
+                        __m3u8ar: true, type: 'processed', session: s
+                    }, '*');
+                } catch (e) { logError('postMessage 失败:', e); }
+                return;
+            }
+
+            updateActiveSession(s);
+            updateFilterTip();
+            showResultToast(s);
+            return;
+        }
+
+        if (!result.session) return;
+
         const key = url || '';
         const now = Date.now();
         if (key && key === lastProcessedUrl && now - lastProcessedTime < STATUS_DEDUP_WINDOW_MS) return;
-        lastProcessedUrl = key; lastProcessedTime = now;
+        lastProcessedUrl = key;
+        lastProcessedTime = now;
 
         updateActiveSession(result.session);
 
@@ -1554,7 +2020,7 @@
         }
 
         updateFilterTip();
-        showResultToast(result.changed, activeSession.adLines.length);
+        showResultToast(activeSession);
     }
 
     // ============================================================
@@ -1598,17 +2064,23 @@
                     return Reflect.apply(target, thisArg, args);
                 }
 
+                // 请求发出，立即通知 pending
+                notifyM3U8Pending(reqUrl);
+
                 function getFiltered() {
                     const cached = RESP_CACHE.get(xhr);
                     if (cached !== undefined) return cached;
+
                     let original = '';
                     try {
                         original = origGetResponseText ? origGetResponseText.call(xhr) : '';
                     } catch (e) { original = ''; }
-                    if (!original || original.slice(0, 64).indexOf('#EXTM3U') === -1) {
+
+                    if (!original) {
                         RESP_CACHE.set(xhr, original);
                         return original;
                     }
+
                     const url = xhr.responseURL || reqUrl || '';
                     let result;
                     try {
@@ -1618,9 +2090,11 @@
                         RESP_CACHE.set(xhr, original);
                         return original;
                     }
+
                     onM3U8Processed(result, url);
-                    RESP_CACHE.set(xhr, result.modified);
-                    return result.modified;
+                    const out = result.changed ? result.modified : original;
+                    RESP_CACHE.set(xhr, out);
+                    return out;
                 }
 
                 try {
@@ -1692,9 +2166,13 @@
                     return Reflect.apply(target, thisArg, args);
                 }
 
+                // 请求发出，立即通知 pending
+                notifyM3U8Pending(url);
+
                 return Reflect.apply(target, thisArg, args).then(function (response) {
                     return response.clone().text().then(function (text) {
-                        if (!isM3U8Content(text)) return response;
+                        if (!text) return response;
+
                         logInfo('hookFetch 命中:', url);
                         let result;
                         try {
@@ -1703,8 +2181,13 @@
                             logError('hookFetch 处理失败:', e);
                             return response;
                         }
+
+                        if (result.isMaster) return response;
+
                         onM3U8Processed(result, url);
+
                         if (!result.changed) return response;
+
                         const headers = new Headers(response.headers);
                         headers.delete('content-length');
                         return new Response(result.modified, {
@@ -1753,6 +2236,21 @@
             }
             if (d.type === 'resetUriHits') { uriHits.clear(); return; }
 
+            if (d.type === 'pending') {
+                cancelAllPendingVideoChecks();
+
+                // 清除去重状态
+                lastProcessedUrl = '';
+                lastProcessedTime = 0;
+
+                const s = createSession(d.url);
+                s.outcome = 'pending';
+                updateActiveSession(s);
+                refreshHlsMenu();
+                updateFilterTip();
+                return;
+            }
+
             if (d.type === 'nonM3U8') {
                 detectedNonM3U8 = true;
                 refreshHlsMenu();
@@ -1782,8 +2280,7 @@
             updateActiveSession(d.session);
             refreshHlsMenu();
             updateFilterTip();
-            const hasAds = activeSession.adLines.length > 0;
-            showResultToast(hasAds, activeSession.adLines.length);
+            showResultToast(activeSession);
         });
     }
 
@@ -1844,7 +2341,7 @@
         });
     }
 
-    // 22.2 Hook 初始化：异步延后 + Watchdog 自愈
+    // 22.2 Hook 初始化
     function doInitHooks() {
         if (hookInitialized) return;
         if (!shouldEnableHook()) return;
@@ -1940,6 +2437,71 @@
         return !whitelistMode || hostInWhitelist || parentWhitelistPassed;
     }
 
+    // 根据 session.outcome 生成菜单标题
+    function buildFilterTipTitle(session) {
+        const outcome = session.outcome || 'none';
+
+        if (outcome === 'pending') {
+            return '🔄 正在检查 m3u8…';
+        }
+        if (outcome === 'filtered') {
+            return '✅ 已过滤视频切片广告（点击查看日志）';
+        }
+        if (outcome === 'no-ads') {
+            return '✅ 已检查 m3u8，未发现广告';
+        }
+        if (outcome === 'invalid') {
+            const pe = session.parseError;
+            if (pe === 'empty') return '⚠️ m3u8 响应为空';
+            if (pe === 'html') return '⚠️ m3u8 响应是 HTML';
+            if (pe === 'not-m3u8') return '⚠️ m3u8 响应不是 m3u8';
+            if (pe === 'empty-playlist') return '⚠️ m3u8 无分片内容';
+            return '⚠️ m3u8 响应无效';
+        }
+        if (outcome === 'parse-error') {
+            return '⚠️ m3u8 解析失败';
+        }
+        return null;
+    }
+
+    function showOutcomeModal(session) {
+        const outcome = session.outcome || 'none';
+
+        if (outcome === 'pending') {
+            showModal('正在检查 m3u8 请求…<br><br>请稍候。', '提示');
+            return;
+        }
+
+        if (outcome === 'filtered') {
+            showFilterLog();
+            return;
+        }
+
+        if (outcome === 'no-ads') {
+            showModal('本次 m3u8 中未检测到广告片段。<br><br>无需过滤。', '提示');
+            return;
+        }
+
+        if (outcome === 'invalid') {
+            const pe = session.parseError;
+            let text;
+            if (pe === 'empty') text = 'm3u8 响应为空，无法处理。';
+            else if (pe === 'html') text = 'm3u8 响应是 HTML 页面（可能是错误页或重定向），无法处理。';
+            else if (pe === 'not-m3u8') text = 'm3u8 响应内容不是有效的 m3u8 播放列表。';
+            else if (pe === 'empty-playlist') text = 'm3u8 播放列表中无分片内容。';
+            else text = 'm3u8 响应无效。';
+            showModal(text, '提示');
+            return;
+        }
+
+        if (outcome === 'parse-error') {
+            showModal('m3u8 解析失败：' + escapeHtml(session.parseError || ''), '提示');
+            return;
+        }
+
+        showModal('还未检测到 m3u8 请求。<br><br>请先在页面中播放视频，然后再点击此菜单。', '提示');
+    }
+
     function updateFilterTip() {
         refreshHlsMenu();
 
@@ -1949,20 +2511,25 @@
 
         if (!activeSession.url) {
             menuIds.filterTip = GM_registerMenuCommand(
-                '⚠️ 还没有过滤视频切片广告',
-                () => showModal('还没有检测到 m3u8 请求。<br><br>请先在页面中播放视频，然后再点击此菜单。', '提示')
+                '⚠️ 尚未过滤视频切片广告',
+                () => showModal('尚未检测到 m3u8 请求。<br><br>请先在页面中播放视频，然后再点击此菜单。', '提示')
             );
-        } else if (activeSession.adLines.length > 0) {
-            menuIds.filterTip = GM_registerMenuCommand(
-                '✅ 已过滤视频切片广告（点击查看日志）',
-                showFilterLog
-            );
-        } else {
-            menuIds.filterTip = GM_registerMenuCommand(
-                '✅ 已检查 m3u8，未发现广告',
-                () => showModal('本次 m3u8 中没有检测到广告片段。<br><br>无需过滤。', '提示')
-            );
+            return;
         }
+
+        const title = buildFilterTipTitle(activeSession);
+        if (title) {
+            menuIds.filterTip = GM_registerMenuCommand(
+                title,
+                () => showOutcomeModal(activeSession)
+            );
+            return;
+        }
+
+        menuIds.filterTip = GM_registerMenuCommand(
+            '⚠️ 尚未过滤视频切片广告',
+            () => showModal('尚未检测到 m3u8 请求。<br><br>请先在页面中播放视频，然后再点击此菜单。', '提示')
+        );
     }
 
     function reloadSoon() {
@@ -2040,7 +2607,54 @@
     }
 
     // ============================================================
-    // 24. 视频加载检测
+    // 24. 导出
+    // ============================================================
+    function downloadBlob(content, filename, mime) {
+        const blob = new Blob([content], { type: mime || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        (document.body || document.documentElement).appendChild(a);
+        a.click();
+        setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 200);
+    }
+
+    function exportAdM3U8() {
+        if (!activeSession.url) { toast('info', '尚未检测到 m3u8，请先播放视频'); return; }
+        if (activeSession.adLines.length === 0) { toast('info', '本次未发现广告，无需导出'); return; }
+        const resultLines = [];
+        if (activeSession.headLines.length > 0) resultLines.push(...activeSession.headLines);
+        else { resultLines.push('#EXTM3U'); resultLines.push('#EXT-X-TARGETDURATION:10'); }
+        if (resultLines[0] !== '#EXTM3U') resultLines.unshift('#EXTM3U');
+        for (const line of activeSession.adLines) {
+            if (!line) continue;
+            if (line.startsWith('#')) resultLines.push(absolutizeAttrUri(line, activeSession.url));
+            else resultLines.push(resolveUri(line, activeSession.url));
+        }
+        if (!resultLines.includes('#EXT-X-ENDLIST')) resultLines.push('#EXT-X-ENDLIST');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        downloadBlob(resultLines.join('\n'), `ad_segments_${stamp}.m3u8`, 'application/vnd.apple.mpegurl');
+        toast('success', `广告片段已导出（${activeSession.adLines.length} 行）`);
+    }
+
+    function exportCleanM3U8() {
+        if (!activeSession.url) { toast('info', '尚未检测到 m3u8，请先播放视频'); return; }
+        if (!activeSession.filtered) { toast('info', '尚无可导出的 m3u8 内容'); return; }
+        const lines = activeSession.filtered.split('\n');
+        const out = [];
+        for (const line of lines) {
+            if (!line) { out.push(line); continue; }
+            if (line.startsWith('#')) out.push(absolutizeAttrUri(line, activeSession.url));
+            else out.push(resolveUri(line, activeSession.url));
+        }
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        downloadBlob(out.join('\n'), `clean_${stamp}.m3u8`, 'application/vnd.apple.mpegurl');
+        toast('success', '无广告 m3u8 已导出');
+    }
+
+    // ============================================================
+    // 25. 视频加载检测
     // ============================================================
     function monitorVideo() {
         if (!shouldEnableHook()) return;
@@ -2128,7 +2742,7 @@
     }
 
     // ============================================================
-    // 25. 初始化
+    // 26. 初始化
     // ============================================================
     function main() {
         console.log('[AD] loaded in', unsafeWindow.location.href);

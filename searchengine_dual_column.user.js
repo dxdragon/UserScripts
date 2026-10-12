@@ -1,32 +1,85 @@
 // ==UserScript==
 // @name         搜索引擎双列
 // @namespace    https://github.com/dxdragon/UserScripts
-// @version      1.0
-// @description  去广告 + 双列卡片（响应式）
+// @version      1.1.0
+// @description  去广告 + 双列瀑布流
 // @author       Shay
 // @run-at       document-start
-// @include      *://www.baidu.com/*
-// @include      *://m.baidu.com/*
-// @include      *://*.bing.com/*
-// @include      *://*.google*/search*
-// @include      *://www.so.com/s?*
+// @include      *://cn.bing.com/*
+// @include      *://www.bing.com/*
+// @include      *://www.google*/search*
 // @include      *://duckduckgo.com/*
-// @include      *://*.startpage.com/*
+// @include      *://www.startpage.com/*
 // @include      *://search.brave.com/*
 // @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @updateURL    https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/searchengine_dual_column.user.js
 // @downloadURL  https://gh-proxy.com/raw.githubusercontent.com/dxdragon/UserScripts/main/searchengine_dual_column.user.js
 // ==/UserScript==
 
 (() => {
   'use strict';
+  
+  const AC_DEBUG = false;   // 调试开关
 
+  /* ============================================================
+   * 配置：每站点 { auto, value }
+   *   auto=true  → 运行时按导航栏左边界自动留白
+   *   auto=false → 使用 value 作为固定左右留白（px）
+   * ============================================================ */
+  const CONFIG_KEY = 'ac_config_v1';
+
+  const DEFAULT_CONFIG = {
+    google:    { auto: false, value: 40 },
+    bing:      { auto: false, value: 40 },
+    brave:     { auto: true,  value: 40 },
+    startpage: { auto: false, value: 40 },
+    duck:      { auto: false, value: 40 },
+  };
+
+  const SITE_LABEL = {
+    google: 'Google', bing: 'Bing',
+    brave: 'Brave', startpage: 'Startpage', duck: 'DuckDuckGo',
+  };
+
+  function loadConfig() {
+    let raw = null;
+    try {
+      if (typeof GM_getValue === 'function') raw = GM_getValue(CONFIG_KEY, null);
+      else raw = localStorage.getItem(CONFIG_KEY);
+    } catch {}
+    if (raw) {
+      try {
+        const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const merged = {};
+        for (const k of Object.keys(DEFAULT_CONFIG)) {
+          merged[k] = Object.assign({}, DEFAULT_CONFIG[k], obj[k] || {});
+        }
+        return merged;
+      } catch {}
+    }
+    return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+  }
+
+  function saveConfig(cfg) {
+    const raw = JSON.stringify(cfg);
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(CONFIG_KEY, raw);
+      else localStorage.setItem(CONFIG_KEY, raw);
+    } catch {}
+  }
+
+  const state = { cfg: loadConfig() };
+
+  /* ============================================================
+   * 站点识别
+   * ============================================================ */
   const SITE = (() => {
     const h = location.host;
-    if (h.includes('baidu.com')) return 'baidu';
     if (h.includes('google')) return 'google';
     if (h.includes('bing.com')) return 'bing';
-    if (h.includes('so.com')) return 'haosou';
     if (h.includes('duckduckgo.com')) return 'duck';
     if (h.includes('startpage.com')) return 'startpage';
     if (h.includes('brave.com')) return 'brave';
@@ -34,66 +87,108 @@
   })();
   if (!SITE) return;
 
-  const CFG = {
-    baidu: { item: '#content_left > .c-container', link: 'h3.t > a, .c-container article a', root: '#content_left', colW: 600 },
-    google: { item: '#rso > .MjjYud, #rso > div.g', link: '.zReHs, h3 a', root: '#rso', colW: 620 },
-    bing: { item: '#b_results > li.b_algo', link: 'h2 > a', root: '#b_results', colW: 600 },
-    haosou: { item: '.results > .res-list', link: 'h3 > a', root: '.results', colW: 600 },
-    duck: { item: '.react-results--main > li', link: 'h2 a', root: '.react-results--main', colW: 600 },
-    startpage: { item: '.w-gl > *', link: 'a[href]', root: '.w-gl', colW: 700 },
-    brave: { item: 'div[data-type="web"], .snippet.fdb', link: 'a.search-snippet-title, .snippet-title a, a[href]', root: '#results, .snippet-list', colW: 600 },
-  }[SITE];
+  /* ============================================================
+   * 每站点导航栏选择器（用于 auto 模式）
+   * ============================================================ */
+  const SITE_NAV = {
+    google:    ['#cnt [role="navigation"]', '#cnt nav', '[role="navigation"]'],
+    bing:      ['nav.b_scopebar', 'nav[role="navigation"]', 'nav'],
+    brave:     ['nav.tabs', 'nav[role="tablist"]', '[role="tablist"]', '#search-page nav', 'main nav', 'header nav', 'nav'],
+    startpage: ['nav.inline-nav', 'nav'],
+    duck:      ['#react-duckbar > [class]', '#react-duckbar'],
+  };
 
-  const CONTAINER_W = CFG.colW * 2 + 20;
+  /* ============================================================
+   * 每站点瀑布流容器
+   * ============================================================ */
+  const SITE_CONTAINER = {
+    google:    '#rso',
+    bing:      '#b_results',
+    duck:      '.react-results--main',
+    startpage: '.w-gl',
+    brave:     '#mixed-main',
+  };
+
+  /* ---------- 布局常量 ---------- */
   const COL_MIN = 320;
-  const CONTAINER_WIDTH_CSS = `min(${CONTAINER_W}px, calc(100vw - 40px))`;
+  const COL_GAP = 20;
+  const ROW_GAP = 16;
+  const FALLBACK_MARGIN = 40;
 
-  const CARD_CSS = `
-    flex: 0 1 calc(50% - 10px) !important;
-    min-width: ${COL_MIN}px !important;
-    max-width: ${CFG.colW}px !important;
-    box-sizing: border-box !important;
-    border: 1px solid #e0e0e0 !important;
-    border-radius: 8px !important;
-    padding: 16px !important;
-    background: #fff !important;
-    margin: 0 !important;
-    float: none !important;
-    height: auto !important;
-    align-self: flex-start !important;
-  `;
+  /* ============================================================
+   * ★ 每站点瀑布流容器顶部间距（px）
+   * ============================================================ */
+  const SITE_TOP_PAD = {
+    google:    0,
+    bing:      24,
+    duck:      0,
+    startpage: 0,
+    brave:     20,
+  };
 
-  const FULLROW_CSS = `
-    flex: 1 0 100% !important;
+  /* ============================================================
+   * 导航栏左边界 / margin 解析
+   * ============================================================ */
+  function getLeftAnchor(site) {
+    const sels = SITE_NAV[site] || [];
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const maxLeft = vw * 0.5;
+    for (const sel of sels) {
+      let els;
+      try { els = document.querySelectorAll(sel); } catch { continue; }
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.left >= 0 && r.left < maxLeft) {
+          return Math.round(r.left);
+        }
+      }
+    }
+    return null;
+  }
+
+  function resolveMargin(site) {
+    const c = state.cfg[site] || DEFAULT_CONFIG[site] || { auto: false, value: FALLBACK_MARGIN };
+    if (c.auto) {
+      const a = getLeftAnchor(site);
+      if (a != null) return a;
+    }
+    return Number.isFinite(c.value) ? c.value : FALLBACK_MARGIN;
+  }
+
+  /* ---------- 瀑布流卡片模板（所有站点共用） ---------- */
+  const MASONRY_CARD_CSS = `
+    break-inside: avoid !important;
+    -webkit-column-break-inside: avoid !important;
+    page-break-inside: avoid !important;
     width: 100% !important;
     max-width: 100% !important;
     min-width: 0 !important;
+    margin: 0 0 ${ROW_GAP}px 0 !important;
+    padding: 16px !important;
+    border: 1px solid #e0e0e0 !important;
+    border-radius: 8px !important;
+    background: #fff !important;
     box-sizing: border-box !important;
-    border: none !important;
-    padding: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-    margin: 0 !important;
+    float: none !important;
   `;
 
-  const FLEX_ROOT_CSS = `
-    display: flex !important;
-    flex-wrap: wrap !important;
-    align-content: flex-start !important;
-    align-items: flex-start !important;
-    justify-content: space-between !important;
-    gap: 16px 20px !important;
-    width: ${CONTAINER_WIDTH_CSS} !important;
+  const MASONRY_CROSS_CSS = `
+    column-span: all !important;
+    -webkit-column-span: all !important;
+    width: 100% !important;
+    max-width: 100% !important;
     min-width: 0 !important;
-    max-width: none !important;
-    margin: 0 auto !important;
+    margin: 0 0 ${ROW_GAP}px 0 !important;
     padding: 0 !important;
+    border: none !important;
+    border-radius: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
     box-sizing: border-box !important;
     float: none !important;
   `;
 
   const CSS_BASE = `
-    /* ===== 加载动画 ===== */
     .ac-loading-spinner {
       position: fixed; top: 220px; left: 0; right: 0;
       display: flex; justify-content: center; z-index: 99999;
@@ -114,84 +209,45 @@
     }
     body.ac-ready .ac-loading-spinner { opacity: 0; pointer-events: none; }
 
-    /* =========================================================
-     * 百度
-     * ========================================================= */
-    body.ac-two-col.baidu #wrapper,
-    body.ac-two-col.baidu #container {
+    /* ============================================================
+     * 谷歌
+     * ============================================================ */
+    body.ac-two-col.google #rcnt > :not(#center_col),
+    body.ac-two-col.google #rhs, 
+    body.ac-two-col.google #gevUs > :not(#search) { display: none !important; }
+
+    body.ac-two-col.google #rcnt,
+    body.ac-two-col.google #center_col {
       display: block !important;
       width: 100% !important;
-      max-width: none !important;
-      float: none !important;
-    }
-    body.ac-two-col.baidu #content_left { ${FLEX_ROOT_CSS} }
-    body.ac-two-col.baidu #content_left > .c-container { ${CARD_CSS} }
-    body.ac-two-col.baidu #content_left > [tpl]:not(.c-container) { ${FULLROW_CSS} }
-    body.ac-two-col.baidu #content_right { display: none !important; }
-    .minidiv #logo img { width: 100px; height: unset; margin-top: 0.3rem; }
-    .opr-recommends-merge-imgtext { display: none !important; }
-    .res_top_banner { display: none !important; }
-    .headBlock, body > div.result-op { display: none; }
-
-    /* =========================================================
-     * 谷歌
-     * ★ 策略：
-     *   - 不动 #center_col 宽度（原生 1100px）
-     *   - 不动知识面板
-     *   - #rso 用 JS 精确计算 left 值使其相对视口居中
-     * ========================================================= */
-    body.ac-two-col.google #center_col {
-      overflow: visible !important;
-    }
-
-    /* 初始兜底（JS 未跑时先按这个显示，JS 跑了之后会覆盖） */
-    body.ac-two-col.google #rso {
-      display: flex !important;
-      flex-wrap: wrap !important;
-      align-content: flex-start !important;
-      align-items: flex-start !important;
-      justify-content: space-between !important;
-      gap: 16px 20px !important;
-      width: ${CONTAINER_WIDTH_CSS} !important;
       max-width: none !important;
       min-width: 0 !important;
       margin: 0 !important;
       padding: 0 !important;
-      box-sizing: border-box !important;
       float: none !important;
-      position: relative !important;
+      overflow: visible !important;
+      position: static !important;
     }
+    body.ac-two-col.google #rso > *:not(.MjjYud.ac-card) { display: none !important; }
+    body.ac-two-col.google #rso > .ac-card { ${MASONRY_CARD_CSS} }
+    body.ac-two-col.google #botstuff > [data-hveid] > :not([role="navigation"]) { display: none !important; }
 
-    body.ac-two-col.google #rso > .ac-card { ${CARD_CSS} }
-    body.ac-two-col.google #rso > .ac-empty { display: none !important; }
-    body.ac-two-col.google #rso > .ac-fullrow { ${FULLROW_CSS} }
-
-    body.ac-two-col.google #bottomads,
-    body.ac-two-col.google #tads,
-    body.ac-two-col.google #tadsb { display: none !important; }
-
-    /* =========================================================
+    /* ============================================================
      * 必应
-     * ========================================================= */
+     * ============================================================ */
     body.ac-two-col.bing #b_content {
-      display: flex !important;
-      justify-content: center !important;
-      align-items: flex-start !important;
+      display: block !important;
       width: 100% !important;
       min-width: 0 !important;
       max-width: none !important;
-      padding-left: 0 !important;
-      padding-right: 0 !important;
-      margin-left: 0 !important;
-      margin-right: 0 !important;
+      padding: 0 !important;
+      margin: 0 !important;
       box-sizing: border-box !important;
       float: none !important;
     }
-    body.ac-two-col.bing #b_results { ${FLEX_ROOT_CSS} }
-    body.ac-two-col.bing #b_results > li.b_algo { ${CARD_CSS} }
+    body.ac-two-col.bing #b_results > li.b_algo { ${MASONRY_CARD_CSS} }
     body.ac-two-col.bing #b_results > li.b_ans,
-    body.ac-two-col.bing #b_results > li.b_pag { ${FULLROW_CSS} }
-
+    body.ac-two-col.bing #b_results > li.b_pag { ${MASONRY_CROSS_CSS} }
     body.ac-two-col.bing #b_results > li.b_ans *,
     body.ac-two-col.bing #b_results > li.b_pag * {
       max-width: 100% !important;
@@ -218,10 +274,9 @@
       width: auto !important;
       min-width: 0 !important;
     }
-
     body.ac-two-col.bing #b_context,
-    body.ac-two-col.bing .b_ad { display: none !important; }
-
+    body.ac-two-col.bing #b_content > main > :not(#b_results),
+    body.ac-two-col.bing #b_results > :not(.b_algo) { display: none !important; }
     body.ac-two-col.bing #b_copilot_search,
     body.ac-two-col.bing .b_copilot_search,
     body.ac-two-col.bing .b_copilot_search_container,
@@ -231,45 +286,26 @@
     body.ac-two-col.bing iframe[id*="copilot" i],
     body.ac-two-col.bing iframe[src*="copilot" i] { display: none !important; }
 
-    /* =========================================================
-     * 好搜
-     * ========================================================= */
-    body.ac-two-col.haosou #container,
-    body.ac-two-col.haosou #main {
+    /* ============================================================
+     * DuckDuckGo
+     * ============================================================ */
+    body.ac-two-col.duck .react-results--main > li { ${MASONRY_CARD_CSS} }
+
+    /* ============================================================
+     * Startpage
+     * ============================================================ */
+    body.ac-two-col.startpage #main,
+    body.ac-two-col.startpage main {
       display: block !important;
       width: 100% !important;
       min-width: 0 !important;
       max-width: none !important;
-      float: none !important;
-    }
-    body.ac-two-col.haosou .results { ${FLEX_ROOT_CSS} }
-    body.ac-two-col.haosou .results > .res-list { ${CARD_CSS} }
-    body.ac-two-col.haosou .results > li:not(.res-list) { ${FULLROW_CSS} }
-    body.ac-two-col.haosou #righttop_box,
-    body.ac-two-col.haosou #m-spread-left,
-    body.ac-two-col.haosou #m-spread-bottom { display: none !important; }
-
-    /* =========================================================
-     * DuckDuckGo
-     * ========================================================= */
-    body.ac-two-col.duck .react-results--main { ${FLEX_ROOT_CSS} }
-    body.ac-two-col.duck .react-results--main > li { ${CARD_CSS} }
-
-    /* =========================================================
-     * Startpage
-     * ========================================================= */
-    body.ac-two-col.startpage #main,
-    body.ac-two-col.startpage main {
-      display: block !important;
-      width: ${CONTAINER_WIDTH_CSS} !important;
-      min-width: 0 !important;
-      max-width: none !important;
-      margin-left: auto !important;
-      margin-right: auto !important;
       padding-left: 0 !important;
       padding-right: 0 !important;
+      margin: 0 !important;
       box-sizing: border-box !important;
       float: none !important;
+      overflow-x: visible !important;
     }
     body.ac-two-col.startpage #main > *:not(.w-gl),
     body.ac-two-col.startpage main > *:not(.w-gl) {
@@ -281,63 +317,112 @@
       box-sizing: border-box !important;
       float: none !important;
     }
-    body.ac-two-col.startpage .w-gl {
+    body.ac-two-col.startpage .w-gl > * { ${MASONRY_CARD_CSS} }
+    body.ac-two-col.startpage .w-gl > *:not(:has(a[href])) { display: none !important; }
+    body.ac-two-col.startpage #sidebar,
+    .w-gl-attribution,
+    .result.h { display: none !important; }
+    body.ac-two-col.startpage { overflow-x: hidden !important; }
+
+    /* Startpage：翻页栏居中 */
+    body.ac-two-col.startpage .pagination-container {
       display: flex !important;
-      flex-wrap: wrap !important;
-      align-content: flex-start !important;
-      align-items: flex-start !important;
-      justify-content: space-between !important;
-      gap: 16px 20px !important;
+      justify-content: center !important;
+      align-items: center !important;
       width: 100% !important;
-      min-width: 0 !important;
-      max-width: none !important;
-      margin: 0 !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
       padding: 0 !important;
       box-sizing: border-box !important;
-      float: none !important;
     }
-    body.ac-two-col.startpage .w-gl > * { ${CARD_CSS} }
-    body.ac-two-col.startpage #sponsored,
-    body.ac-two-col.startpage .sponsored,.w-gl-attribution,.result.h { display: none !important; }
-
-    body.ac-two-col.startpage { overflow-x: hidden !important; }
-    body.ac-two-col.startpage #main,
-    body.ac-two-col.startpage main { overflow-x: visible !important; }
-
-    /* =========================================================
-     * Brave Search
-     * ========================================================= */
-    body.ac-two-col.brave main {
-      display: block !important;
-      width: 100% !important;
-      min-width: 0 !important;
-      max-width: none !important;
+    body.ac-two-col.startpage nav.pagination {
+      display: flex !important;
+      justify-content: center !important;
+      align-items: center !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
     }
-    body.ac-two-col.brave #results,
-    body.ac-two-col.brave .snippet-list { ${FLEX_ROOT_CSS} }
-    body.ac-two-col.brave div[data-type="web"],
-    body.ac-two-col.brave .snippet.fdb { ${CARD_CSS} }
-    body.ac-two-col.brave #search-elsewhere-result-wrapper,
-    body.ac-two-col.brave .ad-slot { display: none !important; }
 
-    /* =========================================================
-     * 去广告
-     * ========================================================= */
-    #bottomads, .b_ad, #so_kw-ad,
-    #m-spread-left, #m-spread-bottom,
-    #sponsored, .ad-slot,
+    /* ============================================================
+     * Brave
+     * ============================================================ */
+    body.ac-two-col.brave #search-elsewhere,#search-elsewhere-result-wrapper,
+    body.ac-two-col.brave #related-queries,
+    body.ac-two-col.brave .serp-layout > :not(.serp-columns),
+    body.ac-two-col.brave #mixed-main > *:not([data-pos]):not(#pagination-snippet),
+    body.ac-two-col.brave .serp-columns-side { display: none !important; }
+
+    body.ac-two-col.brave #mixed-main > [data-pos] {
+      ${MASONRY_CARD_CSS}
+      overflow: hidden !important;
+    }
+    body.ac-two-col.brave #mixed-main > *:not([data-pos]) { ${MASONRY_CROSS_CSS} }
+
+    /* ============================================================
+     * 通用去广告
+     * ============================================================ */
+    #bottomads, .b_ad, #so_kw-ad, #tads, #tadsb,
+    #m-spread-left, #m-spread-bottom, #top_ad,
+    #sponsored, .sponsored, .ad-slot,
     div[aria-label="广告"], div[aria-label="Ads"],
     #search-elsewhere-result-wrapper,
-    .result--ad, .js-result-ad { display: none !important; }
+    #search-elsewhere, #related-queries,
+    .result--ad, .js-result-ad,
+    #content_left .ec_ad_results,
+    #content_left [data-tuiguang],
+    #content_left .result-op[class*="ad"],
+    .w-gl__result--ad { display: none !important; }
+
+    /* ============================================================
+     * 配置面板
+     * ============================================================ */
+    #ac-config-panel {
+      position: fixed; top: 80px; right: 20px; z-index: 2147483647;
+      width: 380px; padding: 18px;
+      background: #fff; border: 1px solid #d0d0d0; border-radius: 10px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.18);
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #333;
+    }
+    #ac-config-panel h2 {
+      margin: 0 0 14px; font-size: 15px; font-weight: 600;
+    }
+    .ac-cfg-row {
+      display: grid;
+      grid-template-columns: 110px 90px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .ac-cfg-head {
+      font-weight: 600; color: #666; font-size: 12px;
+      padding-bottom: 6px; margin-bottom: 10px;
+      border-bottom: 1px solid #eee;
+    }
+    .ac-cfg-head span:nth-child(2),
+    .ac-cfg-row > label { text-align: center; }
+    .ac-cfg-row input[type=number] {
+      width: 100%; padding: 5px 8px; border: 1px solid #ccc; border-radius: 5px;
+      font: inherit; box-sizing: border-box;
+    }
+    .ac-cfg-row input[type=number]:disabled {
+      background: #f5f5f5; color: #999; cursor: not-allowed;
+    }
+    .ac-cfg-actions {
+      display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px;
+    }
+    .ac-cfg-actions button {
+      padding: 6px 14px; border: 1px solid #ccc; background: #f8f8f8;
+      border-radius: 6px; cursor: pointer; font: inherit;
+    }
+    .ac-cfg-actions button:hover { background: #eee; }
+    .ac-cfg-actions button[data-act="save"] {
+      background: #4e6ef2; color: #fff; border-color: #4e6ef2;
+    }
+    .ac-cfg-actions button[data-act="save"]:hover { background: #3c5be0; }
   `;
 
   GM_addStyle(CSS_BASE);
-
-  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-
-  function safeRemove(sel) {
-    try { $$(sel).forEach(n => n.remove()); } catch {}
-  }
 
   function markBody() {
     if (!document.body) return;
@@ -346,86 +431,86 @@
   }
 
   /* ============================================================
-   * 清理之前版本残留的内联样式
+   * 通用瀑布流
    * ============================================================ */
-  function cleanupGoogleInlineStyles() {
-    if (SITE !== 'google') return;
+  const MASONRY_RESET_PROPS = [
+    'display', 'column-count', 'column-gap', 'column-fill',
+    'width', 'max-width', 'min-width',
+    'margin', 'margin-left', 'margin-right', 'margin-top', 'margin-bottom',
+    'padding', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+    'float', 'position', 'left', 'right', 'top', 'transform',
+    'grid-template-columns', 'grid-template-rows', 'grid-auto-flow',
+    'grid-column', 'grid-row',
+    'flex', 'flex-basis', 'flex-grow', 'flex-shrink',
+    'flex-wrap', 'flex-direction', 'justify-content', 'align-items', 'align-content',
+    'gap',
+  ];
 
-    const PROPS = [
-      'width', 'max-width', 'min-width',
-      'flex', 'flex-basis', 'flex-grow', 'flex-shrink',
-      'grid-column', 'grid-column-start', 'grid-column-end',
-      'grid-row', 'grid-template-columns', 'grid-template-rows',
-      'grid-template-areas', 'grid-auto-flow',
-      'margin-left', 'margin-right',
-      'float', 'position', 'box-sizing', 'display',
-      'align-self', 'justify-self', 'left', 'transform'
-    ];
+  function applyMasonry(selector, opts) {
+    const containers = document.querySelectorAll(selector);
+    if (!containers.length) return null;
 
-    const kps = document.querySelectorAll(
-      '.kp-wholepage-osrp, [class*="kp-wholepage"], [data-attrid="title"]'
-    );
-    kps.forEach(kp => {
-      let el = kp;
-      let d = 0;
-      while (el && el.tagName !== 'BODY' && el.tagName !== 'HTML' && d < 25) {
-        PROPS.forEach(p => el.style.removeProperty(p));
-        el = el.parentElement;
-        d++;
-      }
-    });
-
-    const rcnt = document.getElementById('rcnt');
-    if (rcnt) PROPS.forEach(p => rcnt.style.removeProperty(p));
-  }
-
-  /* ============================================================
-   * ★ 精确计算 #rso 的 left 偏移，让它相对"视口"居中
-   * ============================================================ */
-  function centerGoogleRso() {
-    if (SITE !== 'google') return;
-    const rso = document.getElementById('rso');
-    const cc = document.getElementById('center_col');
-    if (!rso || !cc) return;
+    const {
+      sideMargin = null,
+      topPad = 0,
+      flattenAncestors = 0,
+    } = opts || {};
 
     const vw = document.documentElement.clientWidth || window.innerWidth;
-    const w = Math.min(CONTAINER_W, vw - 40);
+    const margin = sideMargin != null ? sideMargin : resolveMargin(SITE);
+    const cw = Math.max(COL_MIN, vw - margin * 2);
+    const canTwo = cw >= COL_MIN * 2 + COL_GAP;
 
-    // #center_col 不能裁剪 #rso 的溢出部分
-    cc.style.setProperty('overflow', 'visible', 'important');
+    if (flattenAncestors > 0) {
+      let el = containers[0].parentElement, d = 0;
+      while (el && el.tagName !== 'BODY' && el.tagName !== 'HTML' && d < flattenAncestors) {
+        el.style.setProperty('display', 'block', 'important');
+        el.style.setProperty('width', '100%', 'important');
+        el.style.setProperty('max-width', 'none', 'important');
+        el.style.setProperty('min-width', '0', 'important');
+        el.style.setProperty('margin', '0', 'important');
+        el.style.setProperty('padding', '0', 'important');
+        el.style.setProperty('box-sizing', 'border-box', 'important');
+        el.style.setProperty('float', 'none', 'important');
+        el.style.setProperty('overflow', 'visible', 'important');
+        el.style.setProperty('position', 'static', 'important');
+        el.style.setProperty('left', 'auto', 'important');
+        el.style.setProperty('transform', 'none', 'important');
+        el.style.setProperty('grid-template-columns', 'none', 'important');
+        el.style.setProperty('grid-template-rows', 'none', 'important');
+        el.style.setProperty('grid-auto-flow', 'row', 'important');
+        el.style.setProperty('grid-column', 'auto', 'important');
+        el.style.setProperty('grid-row', 'auto', 'important');
+        el = el.parentElement; d++;
+      }
+    }
 
-    // 设置布局属性
-    rso.style.setProperty('display', 'flex', 'important');
-    rso.style.setProperty('flex-wrap', 'wrap', 'important');
-    rso.style.setProperty('align-content', 'flex-start', 'important');
-    rso.style.setProperty('align-items', 'flex-start', 'important');
-    rso.style.setProperty('justify-content', 'space-between', 'important');
-    rso.style.setProperty('gap', '16px 20px', 'important');
-    rso.style.setProperty('width', w + 'px', 'important');
-    rso.style.setProperty('max-width', 'none', 'important');
-    rso.style.setProperty('min-width', '0', 'important');
-    rso.style.setProperty('margin-left', '0', 'important');
-    rso.style.setProperty('margin-right', '0', 'important');
-    rso.style.setProperty('padding', '0', 'important');
-    rso.style.setProperty('box-sizing', 'border-box', 'important');
-    rso.style.setProperty('position', 'relative', 'important');
-    rso.style.setProperty('float', 'none', 'important');
+    containers.forEach((c, i) => {
+      MASONRY_RESET_PROPS.forEach(p => c.style.removeProperty(p));
+      c.style.setProperty('display', 'block', 'important');
+      c.style.setProperty('column-count', canTwo ? '2' : '1', 'important');
+      c.style.setProperty('column-gap', COL_GAP + 'px', 'important');
+      c.style.setProperty('column-fill', 'balance', 'important');
+      c.style.setProperty('width', cw + 'px', 'important');
+      c.style.setProperty('max-width', cw + 'px', 'important');
+      c.style.setProperty('min-width', '0', 'important');
+      c.style.setProperty('margin-left', 'auto', 'important');
+      c.style.setProperty('margin-right', 'auto', 'important');
+      c.style.setProperty('margin-top', '0', 'important');
+      c.style.setProperty('margin-bottom', '0', 'important');
+      c.style.setProperty('padding-top', (i === 0 ? topPad : 0) + 'px', 'important');
+      c.style.setProperty('padding-right', '0', 'important');
+      c.style.setProperty('padding-bottom', '0', 'important');
+      c.style.setProperty('padding-left', '0', 'important');
+      c.style.setProperty('box-sizing', 'border-box', 'important');
+      c.style.setProperty('float', 'none', 'important');
+    });
 
-    // 先把 left 归零，测出"自然位置"
-    rso.style.setProperty('left', '0px', 'important');
-    // 强制回流
-    void rso.offsetWidth;
-    const naturalLeft = rso.getBoundingClientRect().left;
-
-    // 目标位置：视口水平居中
-    const desiredLeft = (vw - w) / 2;
-    const offset = desiredLeft - naturalLeft;
-
-    rso.style.setProperty('left', offset + 'px', 'important');
+    return { count: containers.length, cw, canTwo, margin };
   }
 
   /* ============================================================
-   * 判断：是否为"标准网页结果"
+   * Google 卡片分类
    * ============================================================ */
   function isStandardWebResult(el) {
     const h3 = el.querySelector('h3');
@@ -435,69 +520,137 @@
     const href = a.getAttribute('href') || '';
     if (!href || href.startsWith('#') || href.startsWith('javascript:')) return false;
     const text = (el.textContent || '');
-    return /https?:\/\/[^\s]+\.[a-z]{2,}/i.test(text) ||
-           /^[a-z0-9-]+(\.[a-z0-9-]+)+([\/?#]|$)/i.test(href) ||
-           !!el.querySelector('cite');
+    return /https?:\/\/[^\s]+\.[a-z]{2,}/i.test(text) || /^[a-z0-9-]+(\.[a-z0-9-]+)+([\/?#]|$)/i.test(href) || !!el.querySelector('cite');
   }
 
   function normalizeGoogleCards() {
     if (SITE !== 'google') return;
-    const rso = document.querySelector('#rso');
-    if (!rso) return;
-
-    for (const el of [...rso.children]) {
-      const tag = el.tagName;
-      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'NOSCRIPT') continue;
-
-      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-
-      if (text.length < 8 && !el.querySelector('a[href]')) {
-        el.classList.remove('ac-card', 'ac-fullrow');
-        el.classList.add('ac-empty');
-        continue;
+    document.querySelectorAll('#rso').forEach(rso => {
+      for (const el of [...rso.children]) {
+        const tag = el.tagName;
+        if (['SCRIPT', 'STYLE', 'LINK', 'NOSCRIPT'].includes(tag)) continue;
+        //el.classList.toggle('ac-card', isStandardWebResult(el));
       }
-
-      if (isStandardWebResult(el)) {
-        el.classList.remove('ac-empty', 'ac-fullrow');
-        el.classList.add('ac-card');
-      } else {
-        el.classList.remove('ac-card', 'ac-empty');
-        el.classList.add('ac-fullrow');
-      }
-    }
+    });
   }
 
+  /* ============================================================
+   * Startpage 空壳隐藏
+   * ============================================================ */
   function normalizeStartpage() {
     if (SITE !== 'startpage') return;
-    const wgl = document.querySelector('.w-gl');
-    if (!wgl) return;
-    for (const el of [...wgl.children]) {
-      if (el.dataset.acClassed) continue;
-      el.dataset.acClassed = '1';
-      const tag = el.tagName;
-      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'NOSCRIPT') continue;
-      const link = el.querySelector('a[href]');
-      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!link || text.length < 10) el.style.setProperty('display', 'none', 'important');
-    }
+    document.querySelectorAll('.w-gl').forEach(wgl => {
+      for (const el of [...wgl.children]) {
+        if (el.dataset.acClassed) continue;
+        el.dataset.acClassed = '1';
+        if (['SCRIPT', 'STYLE', 'LINK', 'NOSCRIPT'].includes(el.tagName)) continue;
+        const link = el.querySelector('a[href]');
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!link || text.length < 10) el.style.setProperty('display', 'none', 'important');
+      }
+    });
   }
 
-  function removeAds() {
-    if (SITE === 'baidu') {
-      safeRemove('#content_right br');
-      safeRemove('#content_left .ec_ad_results');
-      safeRemove('#content_left [data-tuiguang]');
-      safeRemove('#content_left .result-op[class*="ad"]');
-      safeRemove('div[aria-label="广告"], #bottomads');
+  /* ============================================================
+   * 统一布局入口
+   * ============================================================ */
+  function layoutSite() {
+    const sel = SITE_CONTAINER[SITE];
+    if (!sel) return;
+    const opts = { topPad: SITE_TOP_PAD[SITE] ?? 0 };
+    if (SITE === 'brave') {
+      opts.flattenAncestors = 15;
     }
-    if (SITE === 'google') safeRemove('#bottomads, div[aria-label="广告"], div[aria-label="Ads"]');
-    if (SITE === 'bing') safeRemove('.b_ad, #b_results > li.b_ad');
-    if (SITE === 'haosou') safeRemove('#so_kw-ad, #m-spread-left, #m-spread-bottom');
-    if (SITE === 'duck') safeRemove('.result--ad, .js-result-ad');
-    if (SITE === 'startpage') safeRemove('#sponsored, .sponsored, .w-gl__result--ad');
-    if (SITE === 'brave') safeRemove('.ad-slot, #search-elsewhere-result-wrapper');
+    // DDG：auto 模式需要保留祖先 padding 让锚点有效；
+    //      固定 margin 模式需要清掉 padding 才能对称居中
+    if (SITE === 'duck' && !state.cfg.duck?.auto) {
+      opts.flattenAncestors = 15;
+    }
+    const r = applyMasonry(sel, opts);
+    if (AC_DEBUG && r) console.log(`[ac-${SITE}]`, r, ', auto=', state.cfg[SITE]?.auto);
   }
 
+  /* ============================================================
+   * 配置面板
+   * ============================================================ */
+  function openConfigPanel() {
+    if (!document.body) return;
+    if (document.getElementById('ac-config-panel')) return;
+
+    const cfg = JSON.parse(JSON.stringify(state.cfg));
+    const panel = document.createElement('div');
+    panel.id = 'ac-config-panel';
+
+    let rows = '';
+    for (const s of Object.keys(DEFAULT_CONFIG)) {
+      const c = cfg[s];
+      rows += `<div class="ac-cfg-row" data-site="${s}">
+        <span>${SITE_LABEL[s] || s}</span>
+        <label><input type="checkbox" data-key="auto" ${c.auto ? 'checked' : ''}></label>
+        <input type="number" data-key="value" min="0" max="500" value="${c.value}">
+      </div>`;
+    }
+
+    panel.innerHTML = `
+      <h2>搜索引擎双列 · 配置</h2>
+      <div class="ac-cfg-row ac-cfg-head">
+        <span>站点</span><span>跟随导航栏</span><span>留白(px)</span>
+      </div>
+      ${rows}
+      <div class="ac-cfg-actions">
+        <button data-act="reset">恢复默认</button>
+        <button data-act="close">取消</button>
+        <button data-act="save">保存</button>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    // 勾选 auto 时禁用数字输入
+    function refreshDisabled() {
+      panel.querySelectorAll('.ac-cfg-row[data-site]').forEach(row => {
+        const auto = row.querySelector('input[data-key="auto"]').checked;
+        row.querySelector('input[data-key="value"]').disabled = auto;
+      });
+    }
+    refreshDisabled();
+
+    panel.addEventListener('change', e => {
+      if (e.target.dataset.key === 'auto') refreshDisabled();
+    });
+
+    panel.addEventListener('click', e => {
+      const act = e.target.dataset.act;
+      if (!act) return;
+
+      if (act === 'close') { panel.remove(); return; }
+
+      if (act === 'reset') {
+        state.cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+        saveConfig(state.cfg);
+        panel.remove();
+        run();
+        return;
+      }
+
+      if (act === 'save') {
+        panel.querySelectorAll('.ac-cfg-row[data-site]').forEach(row => {
+          const site = row.dataset.site;
+          const auto = row.querySelector('input[data-key="auto"]').checked;
+          let v = parseInt(row.querySelector('input[data-key="value"]').value, 10);
+          if (!Number.isFinite(v) || v < 0) v = FALLBACK_MARGIN;
+          state.cfg[site] = { auto, value: v };
+        });
+        saveConfig(state.cfg);
+        panel.remove();
+        run();
+        return;
+      }
+    });
+  }
+
+  /* ============================================================
+   * 调度
+   * ============================================================ */
   let timer = null;
   let running = false;
 
@@ -511,15 +664,20 @@
     running = true;
     try {
       markBody();
-      removeAds();
-      cleanupGoogleInlineStyles();
       normalizeGoogleCards();
       normalizeStartpage();
-      centerGoogleRso();  // ★ 关键：每次 run 都重新居中
+      layoutSite();
     } finally {
       running = false;
     }
   }
+
+  // 注册菜单
+  try {
+    if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand('⚙ 双列配置', openConfigPanel);
+    }
+  } catch {}
 
   new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener('resize', schedule, { passive: true });

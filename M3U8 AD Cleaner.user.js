@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.5.0
+// @version           1.5.1
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -1153,6 +1153,7 @@
             hasAdTag,
             hasKeyword,
             empty: false,
+            mode: TS_MODE.NONE,
             tail,
         };
     }

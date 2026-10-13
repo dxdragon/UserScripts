@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.5.1
+// @version           1.5.2
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -366,7 +366,6 @@
     const STEP_SAMPLE_COUNT = 32;
     const NUMERIC_MAX_STEP = 10;
 
-    // 短区间策略参数
     const SHORT_MAX_COUNT = 5;
     const SHORT_MODE_THRESHOLD = 5;
     const SHORT_FREQ_MAX = 5;
@@ -473,7 +472,6 @@
     let pendingToastTimer = null;
     let lastToastTime = 0;
     let lastToastHadAds = false;
-    let lastNoAdToastEl = null;
 
     let nativeHlsHintShownThisSession = false;
     let detectedNonM3U8 = false;
@@ -481,6 +479,7 @@
     function createSession(url) {
         return {
             url: url || '',
+            sourceKey: getSourceKey(url || ''),
             adLines: [],
             headLines: [],
             logs: [],
@@ -499,19 +498,6 @@
             session.logs.splice(0, session.logs.length - LOG_MAX + 50);
         }
         session.logs.push({ rule, text });
-    }
-
-    function logFilter(session, rule, text) {
-        if (DEBUG) {
-            const textStr = Array.isArray(text) ? text.join('\n') : text;
-            console.log(
-                '%c[AD]',
-                'font-weight:bold;color:#fff;background:#70b566;padding:2px;border-radius:2px;',
-                rule, '\n' + textStr
-            );
-        }
-        logPush(session, rule, text);
-        session.changed = true;
     }
 
     function logInfo(...args) {
@@ -704,7 +690,25 @@
     // ============================================================
     function looksLikeM3U8(url) {
         if (!url || typeof url !== 'string') return false;
-        return url.indexOf('m3u8') !== -1;
+        let end = url.length;
+        const q = url.indexOf('?');
+        if (q !== -1 && q < end) end = q;
+        const h = url.indexOf('#');
+        if (h !== -1 && h < end) end = h;
+        return /\.m3u8$/i.test(url.slice(0, end));
+    }
+
+    // ★ 源标识 —— host + 目录路径（去掉文件名和 query）
+    function getSourceKey(url) {
+        if (!url) return '';
+        try {
+            const u = new URL(url);
+            const parts = u.pathname.split('/');
+            parts.pop();
+            return u.host + '/' + parts.filter(Boolean).join('/');
+        } catch (e) {
+            return url;
+        }
     }
 
     function parseExtinfDuration(line) {
@@ -864,9 +868,8 @@
     }
 
     // ============================================================
-    // 8. 核心过滤算法（与 filter.js 一致，纯算法，无浏览器 API 依赖）
+    // 8. 核心过滤算法
     // ============================================================
-
     const AD_PATH_HIGH = [
         'adjump',
         'adform', 'admaster', 'adsage', 'adwords',
@@ -928,7 +931,6 @@
         return null;
     }
 
-    // LCP/LCS 骨架探测：退化时只要骨架里还有字符且边界是数字就继续缩
     function trySkeleton(strings) {
         if (strings.length < 3) return { ok: false };
 
@@ -1158,7 +1160,6 @@
         };
     }
 
-    // 按组提取数字 + 按 LCP/LCS 分组共享基准值
     function extractNumbers(groups) {
         let numCount = 0;
         const first32Nums = [];
@@ -1572,7 +1573,6 @@
         const out = [];
         const ads = [];
         let removedCount = 0;
-        // 主要解决短区间误过滤正常片段导致音画不同步的问题，其他模式全删
         const keepRearDisc = (playlist.mode === TS_MODE.SHORT_INTERVAL);
 
         for (let i = 0; i < playlist.header.length; i++) {
@@ -1765,7 +1765,7 @@
     }
 
     // ============================================================
-    // 8.1 统一入口：调用 filterM3U8 并适配脚本 session 结构
+    // 8.1 统一入口
     // ============================================================
     function processM3U8(text, url) {
         if (!text || typeof text !== 'string') {
@@ -1797,7 +1797,6 @@
             };
         }
 
-        // 正常流程：构造 session
         const session = createSession(url || '');
         session.filtered = result.modified;
         session.changed = result.changed;
@@ -1813,7 +1812,6 @@
             logPush(session, ruleText, result.ads);
         }
 
-        // 记录 URI 目标（extractUriTargets 兼容）
         const rawLines = text.split('\n');
         const uriTargets = extractUriTargets(rawLines);
         uriHits.clear();
@@ -1837,28 +1835,39 @@
     // ============================================================
     // 19. 状态回调
     // ============================================================
+    // 三分支状态机（对齐 Firefox）
     function updateActiveSession(newSession) {
         if (!newSession) return;
 
-        // pending：替换非 pending 的旧 session
-        // （视频重新加载时能立即清旧数据；连续重复请求不刷屏）
-        if (newSession.outcome === 'pending') {
-            if (activeSession.outcome !== 'pending') {
-                activeSession = newSession;
-            }
-            return;
-        }
+        const hasNewAds = newSession.adLines && newSession.adLines.length > 0;
+        const hasOldAds = activeSession && activeSession.adLines && activeSession.adLines.length > 0;
+        const sameLine = activeSession && activeSession.sourceKey &&
+                         newSession.sourceKey === activeSession.sourceKey;
+        const wasPending = activeSession && activeSession.outcome === 'pending';
 
-        // 非 pending 且 URL 变化：无条件替换
-        if (newSession.url && newSession.url !== activeSession.url) {
+        // ---- pending：保留旧 filtered / headLines（无广告也能导出） ----
+        if (newSession.outcome === 'pending') {
+            newSession.filtered = activeSession.filtered || '';
+            newSession.headLines = activeSession.headLines || [];
+            newSession.adLines = [];
             activeSession = newSession;
             return;
         }
 
-        // 非 pending 且同 URL：有广告优先
-        const hasNewAds = newSession.adLines && newSession.adLines.length > 0;
-        const hasOldAds = activeSession && activeSession.adLines && activeSession.adLines.length > 0;
-        if (hasNewAds || !hasOldAds) activeSession = newSession;
+        // ---- 有广告：无条件更新 ----
+        if (hasNewAds) {
+            activeSession = newSession;
+            return;
+        }
+
+        // ---- 无广告/错误 且 同源 且 之前不是 pending：完全不动 ----
+        // 关键：wasPending 时不能保持（否则 pending → no-ads 转换被拦，永远停在 pending）
+        if (sameLine && !wasPending) {
+            return;
+        }
+
+        // ---- 无广告/错误 且（不同源 或 之前是 pending）：替换 ----
+        activeSession = newSession;
     }
 
     function notifyM3U8Pending(url) {
@@ -1871,7 +1880,6 @@
             return;
         }
 
-        // 清除去重状态，让随后到达的响应能正常更新
         lastProcessedUrl = '';
         lastProcessedTime = 0;
 
@@ -1882,7 +1890,6 @@
         updateFilterTip();
     }
 
-    // 根据 session 生成弹窗内容
     function buildStatusToast(session) {
         const outcome = session.outcome || 'none';
 
@@ -1944,7 +1951,6 @@
             return;
         }
 
-        // 非广告类：短窗口去重 + 延迟，避免和广告提示抢屏
         if (now - lastToastTime < STATUS_DEDUP_WINDOW_MS && lastToastHadAds) return;
 
         if (pendingToastTimer) clearTimeout(pendingToastTimer);
@@ -1954,15 +1960,45 @@
             if (t - lastToastTime < STATUS_DEDUP_WINDOW_MS && lastToastHadAds) return;
             lastToastTime = t;
             lastToastHadAds = false;
-            lastNoAdToastEl = toast(info.type, info.text, info.duration);
+            toast(info.type, info.text, info.duration);
         }, TOAST_DELAY_NO_AD_MS);
+    }
+
+    // ★ 新增：网络失败处理（对齐 Firefox filter.onerror）
+    function onM3U8NetworkError(url) {
+        if (unsafeWindow.self !== unsafeWindow.top) {
+            try {
+                unsafeWindow.top.postMessage({
+                    __m3u8ar: true, type: 'networkError', url: url
+                }, '*');
+            } catch (e) {}
+            return;
+        }
+
+        // 没有历史过滤记录 → 不动（避免首次加载失败清状态）
+        const hasOldAds = activeSession && activeSession.adLines && activeSession.adLines.length > 0;
+        if (!hasOldAds) return;
+
+        const failedSourceKey = getSourceKey(url);
+
+        // 同源失败 → 不动（音轨失败不影响主视频状态）
+        if (failedSourceKey === activeSession.sourceKey) return;
+
+        // 不同源失败 → 视为换线路 → 替换（清 badge）
+        const s = createSession(url);
+        s.outcome = 'parse-error';
+        s.parseError = 'network-error';
+        s.filtered = '';
+        s.changed = false;
+        s.adLines = [];
+
+        activeSession = s;
+        updateFilterTip();
     }
 
     function onM3U8Processed(result, url) {
         if (!result || result.isMaster) return;
 
-        // 响应层面错误（empty / html / not-m3u8 / empty-playlist）
-        // 或解析错误（too many lines / split failed / ...）
         if (result.error) {
             let outcome;
             if (result.error === 'empty' ||
@@ -2065,8 +2101,19 @@
                     return Reflect.apply(target, thisArg, args);
                 }
 
-                // 请求发出，立即通知 pending
                 notifyM3U8Pending(reqUrl);
+
+                // ★ 网络失败监听（error / timeout），只触发一次
+                try {
+                    let networkErrNotified = false;
+                    const onNetworkErr = function () {
+                        if (networkErrNotified) return;
+                        networkErrNotified = true;
+                        onM3U8NetworkError(reqUrl);
+                    };
+                    xhr.addEventListener('error', onNetworkErr);
+                    xhr.addEventListener('timeout', onNetworkErr);
+                } catch (e) {}
 
                 function getFiltered() {
                     const cached = RESP_CACHE.get(xhr);
@@ -2167,7 +2214,6 @@
                     return Reflect.apply(target, thisArg, args);
                 }
 
-                // 请求发出，立即通知 pending
                 notifyM3U8Pending(url);
 
                 return Reflect.apply(target, thisArg, args).then(function (response) {
@@ -2200,6 +2246,10 @@
                         logError('hookFetch 处理失败:', e);
                         return response;
                     });
+                }).catch(function (e) {
+                    // ★ 请求失败（网络错误、CORS、超时）
+                    onM3U8NetworkError(url);
+                    throw e;
                 });
             }
         });
@@ -2239,8 +2289,6 @@
 
             if (d.type === 'pending') {
                 cancelAllPendingVideoChecks();
-
-                // 清除去重状态
                 lastProcessedUrl = '';
                 lastProcessedTime = 0;
 
@@ -2272,6 +2320,12 @@
                         );
                     }
                 }
+                return;
+            }
+
+            if (d.type === 'networkError') {
+                cancelAllPendingVideoChecks();
+                onM3U8NetworkError(d.url);
                 return;
             }
 
@@ -2351,7 +2405,7 @@
     }
 
     // ============================================================
-    // 22.3 通用 hook 安装机制（同步 + 异步补装 + Watchdog 自愈）
+    // 22.3 通用 hook 安装机制
     // ============================================================
     let hookSignatures = null;
     let watchdogTimer = null;
@@ -2438,7 +2492,6 @@
         return !whitelistMode || hostInWhitelist || parentWhitelistPassed;
     }
 
-    // 根据 session.outcome 生成菜单标题
     function buildFilterTipTitle(session) {
         const outcome = session.outcome || 'none';
 
@@ -2618,7 +2671,7 @@
         a.download = filename;
         (document.body || document.documentElement).appendChild(a);
         a.click();
-        setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 200);
+        setTimeout(() => { try { a.remove(); } catch (e) {} }, 3000);
     }
 
     function exportAdM3U8() {

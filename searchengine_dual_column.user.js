@@ -21,7 +21,7 @@
 
 (() => {
   'use strict';
-  
+
   const AC_DEBUG = false;   // 调试开关
 
   /* ============================================================
@@ -213,7 +213,7 @@
      * 谷歌
      * ============================================================ */
     body.ac-two-col.google #rcnt > :not(#center_col),
-    body.ac-two-col.google #rhs, 
+    body.ac-two-col.google #rhs,
     body.ac-two-col.google #gevUs > :not(#search) { display: none !important; }
 
     body.ac-two-col.google #rcnt,

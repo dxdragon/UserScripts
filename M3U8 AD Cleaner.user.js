@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.5.2
+// @version           1.5.3
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -395,6 +395,12 @@
             },
         },
         {
+            name: 'jimxtc',
+            test: /^(?:[-\w]+\.)*jimxtc\.com$/i,
+            strategies: ['short', 'float33'],
+            options: {},
+        },
+        {
             name: 'default',
             test: /.*/,
             strategies: ['short'],
@@ -718,6 +724,13 @@
         return isNaN(v) ? null : v;
     }
 
+    const FLOAT33_REGEX = /^\d+\.\d3{2,}$/;
+
+    function isFloat33Duration(duration) {
+        if (duration === null || duration === undefined) return false;
+        return FLOAT33_REGEX.test(String(duration));
+    }
+
     function cleanUri(uri) {
         let s = uri;
         const schemeIdx = s.indexOf('://');
@@ -931,16 +944,29 @@
         return null;
     }
 
-    function trySkeleton(strings) {
-        if (strings.length < 3) return { ok: false };
+    function commonPrefixLen(a, b) {
+        let p = 0;
+        const minLen = Math.min(a.length, b.length);
+        while (p < minLen && a[p] === b[p]) p++;
+        return p;
+    }
 
-        const first = strings[0];
+    // 单组名字 → 算 LCP/LCS
+    // 返回 null：样本不足 3 个
+    // 返回 { lcp, lcs, empty }：
+    //   - empty=true: LCP+LCS 覆盖整个文件名 → 无中间可提取部分
+    //   - lcp/lcs 可能为空字符串，不拒绝，交给调用方判断
+    function trySkeleton(strippedNames) {
+        const n = strippedNames.length;
+        if (n < 3) return null;
+
+        const first = strippedNames[0];
         const firstLen = first.length;
         let lcpLen = firstLen;
         let lcsLen = firstLen;
 
-        for (let i = 1; i < strings.length; i++) {
-            const b = strings[i];
+        for (let i = 1; i < n; i++) {
+            const b = strippedNames[i];
             const bLen = b.length;
 
             let p = 0;
@@ -954,23 +980,13 @@
             lcsLen = s;
         }
 
-        while (lcpLen + lcsLen > 0) {
-            const lcpLast = lcpLen > 0 ? first[lcpLen - 1] : '';
-            const lcsFirst = lcsLen > 0 ? first[firstLen - lcsLen] : '';
-
-            const lcpIsDigit = lcpLen > 0 && lcpLast >= '0' && lcpLast <= '9';
-            const lcsIsDigit = lcsLen > 0 && lcsFirst >= '0' && lcsFirst <= '9';
-
-            if (lcpIsDigit) lcpLen--;
-            else if (lcsIsDigit) lcsLen--;
-            else break;
+        if (lcpLen + lcsLen >= firstLen) {
+            return { lcp: '', lcs: '', empty: true };
         }
-
-        if (lcpLen + lcsLen >= firstLen) return { ok: false };
 
         const lcp = lcpLen === 0 ? '' : first.slice(0, lcpLen);
         const lcs = lcsLen === 0 ? '' : first.slice(firstLen - lcsLen);
-        return { ok: true, lcp, lcs };
+        return { lcp, lcs, empty: false };
     }
 
     function parsePlaylist(rawLines) {
@@ -1033,6 +1049,7 @@
                 segments: [],
                 count: 0,
                 integerCount: 0,
+                float33Count: 0,
                 totalDuration: 0,
                 totalLength: 0,
                 prefixCount: new Map(),
@@ -1077,6 +1094,7 @@
                 const prefix = extractPathPrefix(mediaLine);
                 const len = mediaLine.length;
                 const isIntDur = duration !== null && Number.isInteger(duration);
+                const isFloat33 = isFloat33Duration(duration);
 
                 const lastSlash = path.lastIndexOf('/');
                 const name = lastSlash < 0 ? path : path.slice(lastSlash + 1);
@@ -1099,6 +1117,7 @@
                 curGroup.segments.push(seg);
                 curGroup.count++;
                 if (isIntDur) curGroup.integerCount++;
+                if (isFloat33) curGroup.float33Count++;
                 if (duration !== null) curGroup.totalDuration += duration;
                 curGroup.totalLength += len;
                 curGroup.prefixCount.set(prefix, (curGroup.prefixCount.get(prefix) || 0) + 1);
@@ -1161,67 +1180,126 @@
     }
 
     function extractNumbers(groups) {
-        let numCount = 0;
-        const first32Nums = [];
-        const limit = STEP_SAMPLE_COUNT;
-
+        // ========== 第 1 遍：每组算骨架 ==========
         const groupData = [];
-        const baseMap = new Map();
 
         for (let g = 0; g < groups.length; g++) {
             const grp = groups[g];
             if (grp.count < 3) { groupData.push(null); continue; }
 
-            let version, lcp, lcs;
+            const r = trySkeleton(grp.strippedNames);
+            if (!r) { groupData.push(null); continue; }
 
-            const rA = trySkeleton(grp.strippedNames);
-            if (rA.ok) {
-                version = 'A'; lcp = rA.lcp; lcs = rA.lcs;
-            } else {
-                const rB = trySkeleton(grp.names);
-                if (!rB.ok) { groupData.push(null); continue; }
-                version = 'B'; lcp = rB.lcp; lcs = rB.lcs;
+            groupData.push({
+                lcp: r.lcp,
+                lcs: r.lcs,
+                empty: r.empty,
+                segments: grp.segments,
+                source: grp.strippedNames,
+            });
+        }
+
+        // ========== 第 2 遍：二次 LCP 聚类（只对有实际 lcp 的组） ==========
+        const CLUSTER_THRESHOLD = 0.5;
+        const validIndices = [];
+        for (let g = 0; g < groupData.length; g++) {
+            const d = groupData[g];
+            if (d && !d.empty && d.lcp !== '') validIndices.push(g);
+        }
+
+        const parent = new Map();
+        validIndices.forEach(function (g) { parent.set(g, g); });
+
+        function find(x) {
+            while (parent.get(x) !== x) {
+                parent.set(x, parent.get(parent.get(x)));
+                x = parent.get(x);
             }
+            return x;
+        }
+        function union(a, b) {
+            const ra = find(a), rb = find(b);
+            if (ra !== rb) parent.set(ra, rb);
+        }
 
-            const useStripped = (version === 'A');
-            const source = useStripped ? grp.strippedNames : grp.names;
+        for (let i = 0; i < validIndices.length; i++) {
+            for (let j = i + 1; j < validIndices.length; j++) {
+                const gi = validIndices[i];
+                const gj = validIndices[j];
+                const di = groupData[gi];
+                const dj = groupData[gj];
+
+                if (di.lcs !== dj.lcs) continue;
+
+                const p = commonPrefixLen(di.lcp, dj.lcp);
+                if (p === 0) continue;
+                const minLen = Math.min(di.lcp.length, dj.lcp.length);
+                if (p < minLen * CLUSTER_THRESHOLD) continue;
+
+                union(gi, gj);
+            }
+        }
+
+        const clusterLcp = new Map();
+        validIndices.forEach(function (g) {
+            const root = find(g);
+            const lcp = groupData[g].lcp;
+            if (!clusterLcp.has(root)) {
+                clusterLcp.set(root, lcp);
+            } else {
+                const existing = clusterLcp.get(root);
+                const p = commonPrefixLen(existing, lcp);
+                clusterLcp.set(root, existing.slice(0, p));
+            }
+        });
+
+        validIndices.forEach(function (g) {
+            groupData[g].lcp = clusterLcp.get(find(g));
+        });
+
+        // ========== 第 3 遍：提取 num + 应用 base ==========
+        const baseMap = new Map();
+        let numCount = 0;
+        const first32Nums = [];
+        const limit = STEP_SAMPLE_COUNT;
+
+        for (let g = 0; g < groupData.length; g++) {
+            const d = groupData[g];
+            if (!d) continue;
+
             const nums = [];
             let allValid = true;
 
-            const lcpLen = lcp.length;
-            const lcsLen = lcs.length;
-
-            for (let i = 0; i < source.length; i++) {
-                const s = source[i];
-                if (!s.startsWith(lcp) || (lcs && !s.endsWith(lcs))) {
-                    allValid = false; break;
+            if (d.empty) {
+                for (let i = 0; i < d.source.length; i++) nums.push(0);
+            } else {
+                const lcpLen = d.lcp.length;
+                const lcsLen = d.lcs.length;
+                for (let i = 0; i < d.source.length; i++) {
+                    const s = d.source[i];
+                    if (!s.startsWith(d.lcp)) { allValid = false; break; }
+                    if (d.lcs && !s.endsWith(d.lcs)) { allValid = false; break; }
+                    const mid = s.slice(lcpLen, s.length - lcsLen);
+                    if (!/^\d+$/.test(mid)) { allValid = false; break; }
+                    nums.push(parseInt(mid, 10));
                 }
-                const mid = s.slice(lcpLen, s.length - lcsLen);
-                if (!/^\d+$/.test(mid)) { allValid = false; break; }
-                nums.push(parseInt(mid, 10));
             }
 
-            if (!allValid) { groupData.push(null); continue; }
+            if (!allValid) continue;
 
-            const key = version + '\u0001' + lcp + '\u0001' + lcs;
-            groupData.push({ nums, segs: grp.segments, key });
-        }
-
-        for (let g = 0; g < groupData.length; g++) {
-            const d = groupData[g];
-            if (!d) continue;
-            if (!baseMap.has(d.key)) {
-                baseMap.set(d.key, d.nums[0]);
+            let base;
+            if (d.lcp === '' && d.lcs === '') {
+                // 无公共前后缀：组间无交集 → 各自独立 base
+                base = nums[0];
+            } else {
+                const key = 'A\u0001' + d.lcp + '\u0001' + d.lcs;
+                if (!baseMap.has(key)) baseMap.set(key, nums[0]);
+                base = baseMap.get(key);
             }
-        }
 
-        for (let g = 0; g < groupData.length; g++) {
-            const d = groupData[g];
-            if (!d) continue;
-            const base = baseMap.get(d.key);
-            for (let i = 0; i < d.nums.length; i++) {
-                const adjusted = d.nums[i] - base;
-                d.segs[i].num = adjusted;
+            for (let i = 0; i < nums.length; i++) {
+                const adjusted = nums[i] - base;
+                d.segments[i].num = adjusted;
                 numCount++;
                 if (first32Nums.length < limit) first32Nums.push(adjusted);
             }
@@ -1472,6 +1550,18 @@
         }
         return result;
     }
+    
+    // float33：区间内时长末两位为 33 的片段占比 > 0.5 → 广告区间
+    function strategyFloat33(intervals) {
+        const result = new Set();
+        for (let i = 0; i < intervals.length; i++) {
+            const it = intervals[i];
+            if (it.count === 0) continue;
+            if (it.float33Count * 2 <= it.count) continue;
+            result.add(it);
+        }
+        return result;
+    }
 
     function strategyShort(intervals) {
         const result = new Set();
@@ -1531,6 +1621,7 @@
                 group: grp,
                 count: grp.count,
                 integerCount: grp.integerCount,
+                float33Count: grp.float33Count,
                 totalDuration: grp.totalDuration,
             };
         });
@@ -1547,6 +1638,9 @@
             } else if (name === 'integer') {
                 partial = strategyInteger(intervals, rule.options);
                 if (partial.size > 0) rules.add('整数时长');
+            } else if (name === 'float33') {
+                partial = strategyFloat33(intervals);
+                if (partial.size > 0) rules.add('浮点时长');
             } else continue;
             partial.forEach(function (it) { toDelete.add(it); });
         }

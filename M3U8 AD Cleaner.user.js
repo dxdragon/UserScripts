@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.5.3
+// @version           1.5.4
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -1017,7 +1017,6 @@
                 hasAdTag: false,
                 hasKeyword: false,
                 empty: true,
-                mode: TS_MODE.NONE,
                 tail: [],
             };
         }
@@ -1111,6 +1110,7 @@
                     isIntegerDuration: isIntDur,
                     groupId,
                     removed: false,
+                    extraAds: [],
                 };
 
                 segments.push(seg);
@@ -1174,7 +1174,6 @@
             hasAdTag,
             hasKeyword,
             empty: false,
-            mode: TS_MODE.NONE,
             tail,
         };
     }
@@ -1438,6 +1437,25 @@
                 if (removedAny) rules.add('少数派');
             }
         }
+        
+        // 前置清理边界标签
+        const segments = playlist.segments;
+        for (let i = 1; i < segments.length; i++) {
+            if (segments[i - 1].removed && !segments[i].removed) {
+                const prevSeg = segments[i - 1];
+                const seg = segments[i];
+                const newPre = [];
+                for (let j = 0; j < seg.preLines.length; j++) {
+                    const pl = seg.preLines[j];
+                    if (pl.startsWith('#EXT-X-DISCONTINUITY') || matchAdTag(pl)) {
+                        prevSeg.extraAds.push(pl);
+                    } else {
+                        newPre.push(pl);
+                    }
+                }
+                seg.preLines = newPre;
+            }
+        }
 
         return Array.from(rules);
     }
@@ -1518,14 +1536,32 @@
         for (let i = 0; i < n; i++) {
             const seg = segments[i];
 
-            if (i < pos) { seg.removed = true; removedAny = true; continue; }
-            if (!seenPos) { seenPos = true; prevNum = firstNum; continue; }
-
-            if (seg.num !== null && seg.num === prevNum + step) {
+            if (i < pos) { 
+                seg.removed = true; 
+                removedAny = true; 
+            } else if (!seenPos) { 
+                seenPos = true; 
+                prevNum = firstNum; 
+            } else if (seg.num !== null && seg.num === prevNum + step) {
                 prevNum = seg.num;
             } else {
                 seg.removed = true;
                 removedAny = true;
+            }
+
+            // 顺手清理边界
+            if (!seg.removed && i > 0 && segments[i - 1].removed) {
+                const prevSeg = segments[i - 1];
+                const newPre = [];
+                for (let j = 0; j < seg.preLines.length; j++) {
+                    const pl = seg.preLines[j];
+                    if (pl.startsWith('#EXT-X-DISCONTINUITY') || matchAdTag(pl)) {
+                        prevSeg.extraAds.push(pl);
+                    } else {
+                        newPre.push(pl);
+                    }
+                }
+                seg.preLines = newPre;
             }
         }
 
@@ -1659,6 +1695,34 @@
                 it.group.segments[i].removed = true;
             }
         });
+        
+        // 前置清理边界标签（短区间需要保留 1 个 DISC 以应对误删音画不同步）
+        const segments = playlist.segments;
+        for (let i = 1; i < segments.length; i++) {
+            if (segments[i - 1].removed && !segments[i].removed) {
+                const prevSeg = segments[i - 1];
+                const seg = segments[i];
+                const newPre = [];
+                let keptDisc = false;
+                
+                for (let j = 0; j < seg.preLines.length; j++) {
+                    const pl = seg.preLines[j];
+                    if (matchAdTag(pl)) {
+                        prevSeg.extraAds.push(pl);
+                    } else if (pl.startsWith('#EXT-X-DISCONTINUITY')) {
+                        if (!keptDisc) {
+                            newPre.push(pl); // 保留 1 个
+                            keptDisc = true;
+                        } else {
+                            prevSeg.extraAds.push(pl);
+                        }
+                    } else {
+                        newPre.push(pl);
+                    }
+                }
+                seg.preLines = newPre;
+            }
+        }
 
         return Array.from(rules);
     }
@@ -1667,13 +1731,10 @@
         const out = [];
         const ads = [];
         let removedCount = 0;
-        const keepRearDisc = (playlist.mode === TS_MODE.SHORT_INTERVAL);
 
         for (let i = 0; i < playlist.header.length; i++) {
             out.push(playlist.header[i]);
         }
-
-        let prevWasKept = null;
 
         for (let i = 0; i < playlist.segments.length; i++) {
             const seg = playlist.segments[i];
@@ -1687,34 +1748,22 @@
                 removedCount++;
                 ads.push(seg.mediaLine);
                 removedCount++;
-                prevWasKept = false;
+
+                // 输出剥离过来的尾部标签
+                if (seg.extraAds) {
+                    for (let j = 0; j < seg.extraAds.length; j++) {
+                        ads.push(seg.extraAds[j]);
+                        removedCount++;
+                    }
+                }
                 continue;
             }
 
-            let discCount = 0;
             for (let j = 0; j < seg.preLines.length; j++) {
-                const pl = seg.preLines[j];
-                if (pl.startsWith('#EXT-X-DISCONTINUITY')) {
-                    discCount++;
-                } else {
-                    out.push(pl);
-                }
+                out.push(seg.preLines[j]);
             }
-
-            if (discCount > 0) {
-                if (prevWasKept === false && !keepRearDisc) {
-                    for (let k = 0; k < discCount; k++) ads.push('#EXT-X-DISCONTINUITY');
-                    removedCount += discCount;
-                } else {
-                    out.push('#EXT-X-DISCONTINUITY');
-                    removedCount += discCount - 1;
-                    for (let k = 1; k < discCount; k++) ads.push('#EXT-X-DISCONTINUITY');
-                }
-            }
-
             out.push(seg.extinfLine);
             out.push(seg.mediaLine);
-            prevWasKept = true;
         }
 
         for (let i = 0; i < playlist.tail.length; i++) {
@@ -1788,10 +1837,28 @@
         }
 
         if (playlist.hasKeyword) {
-            playlist.mode = TS_MODE.FEATURE;
-            stats.mode = playlist.mode;
-            stats.modeName = TS_MODE_NAME[playlist.mode];
+            stats.mode = TS_MODE.FEATURE;
+            stats.modeName = TS_MODE_NAME[TS_MODE.FEATURE];
             stats.rules = ['关键词'];
+
+            // 前置边界清理
+            const segs = playlist.segments;
+            for (let i = 1; i < segs.length; i++) {
+                if (segs[i - 1].removed && !segs[i].removed) {
+                    const prevSeg = segs[i - 1];
+                    const curSeg = segs[i];
+                    const newPre = [];
+                    for (let j = 0; j < curSeg.preLines.length; j++) {
+                        const pl = curSeg.preLines[j];
+                        if (pl.startsWith('#EXT-X-DISCONTINUITY') || matchAdTag(pl)) {
+                            prevSeg.extraAds.push(pl);
+                        } else {
+                            newPre.push(pl);
+                        }
+                    }
+                    curSeg.preLines = newPre;
+                }
+            }
 
             const ser = serialize(playlist);
             stats.removedLines = ser.removedCount;
@@ -1813,9 +1880,8 @@
         catch (e) { /* 不致命 */ }
 
         const ctx = detectMode(playlist, numStats);
-        playlist.mode = ctx.mode;
-        stats.mode = playlist.mode;
-        stats.modeName = TS_MODE_NAME[playlist.mode] || TS_MODE_NAME[TS_MODE.NONE];
+        stats.mode = ctx.mode;
+        stats.modeName = TS_MODE_NAME[ctx.mode] || TS_MODE_NAME[TS_MODE.NONE];
 
         let rules;
         try {

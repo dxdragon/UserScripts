@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.5.4
+// @version           1.5.5
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -384,7 +384,7 @@
     // ============================================================
     const DOMAIN_RULES = [
         {
-            name: 'ryplay',
+            name: 'ruyi',
             test: /^(?:[-\w]+\.)*ryplay\d*\.com$/i,
             strategies: ['short', 'integer'],
             options: {
@@ -395,10 +395,13 @@
             },
         },
         {
-            name: 'jimxtc',
-            test: /^(?:[-\w]+\.)*jimxtc\.com$/i,
+            name: 'xigua',
+            test: /^(?:[-\w]+\.)*(?:jimxtc|xgplay\d*)\.com$/i,
             strategies: ['short', 'float33'],
-            options: {},
+            options: {
+                minDuration: 9,
+                maxDuration: 11,
+            },
         },
         {
             name: 'default',
@@ -499,11 +502,20 @@
     // ============================================================
     // 5. 日志
     // ============================================================
-    function logPush(session, rule, text) {
+    function logPush(session, rule, text, removedLines) {
         if (session.logs.length >= LOG_MAX) {
             session.logs.splice(0, session.logs.length - LOG_MAX + 50);
         }
-        session.logs.push({ rule, text });
+        // ★ 截断 ads，避免内存膨胀
+        const MAX_LINES = 100;
+        let storedText = text;
+        if (Array.isArray(text) && text.length > MAX_LINES) {
+            storedText = text.slice(0, MAX_LINES)
+                .concat(['...省略 ' + (text.length - MAX_LINES) + ' 行']);
+        }
+        const entry = { rule, text: storedText };
+        if (removedLines) entry.removedLines = removedLines;
+        session.logs.push(entry);
     }
 
     function logInfo(...args) {
@@ -545,6 +557,7 @@
     .m3u8ar-modal .body{padding:14px 18px;overflow:auto;font-size:13px;line-height:1.6}
     .m3u8ar-modal .body .rule{color:#d63384;font-weight:600;margin:8px 0 4px}
     .m3u8ar-modal .body .ad-badge{display:inline-block;font-weight:bold;color:#fff;background:#70b566;padding:2px 6px;border-radius:3px;font-size:11px;margin-right:6px;vertical-align:middle}
+    .m3u8ar-modal .body .ad-label{font-size:11px;color:#888;margin:8px 0 2px}
     .m3u8ar-modal .body pre{background:#f5f5f5;padding:6px 8px;border-radius:6px;white-space:pre-wrap;word-break:break-all;margin:2px 0;font-size:12px;font-family:ui-monospace,Consolas,monospace}
     .m3u8ar-modal footer{padding:10px 18px;border-top:1px solid #eee;text-align:right}
     .m3u8ar-modal footer button{background:#ff679a;color:#fff;border:0;padding:8px 20px;border-radius:8px;cursor:pointer;font-size:13px;margin-left:8px}
@@ -684,6 +697,16 @@
             if (rule) {
                 const badge = isAdRule ? '<span class="ad-badge">[AD]</span>' : '';
                 parts.push(`<div class="rule">${badge}${escapeHtml(rule)}</div>`);
+            }
+            
+            const total = entry.removedLines || (Array.isArray(entry.text) ? entry.text.length : 0);
+            const shown = Array.isArray(entry.text) ? entry.text.length : 0;
+            if (total > 0) {
+                if (total > shown) {
+                    parts.push(`<div class="ad-label">被删内容 ${total} 行（下方仅显示前 ${shown} 行）：</div>`);
+                } else {
+                    parts.push(`<div class="ad-label">被删内容 ${total} 行：</div>`);
+                }
             }
             const textStr = Array.isArray(entry.text) ? entry.text.join('\n') : entry.text;
             parts.push(`<pre>${escapeHtml(textStr)}</pre>`);
@@ -951,42 +974,30 @@
         return p;
     }
 
-    // 单组名字 → 算 LCP/LCS
-    // 返回 null：样本不足 3 个
-    // 返回 { lcp, lcs, empty }：
-    //   - empty=true: LCP+LCS 覆盖整个文件名 → 无中间可提取部分
-    //   - lcp/lcs 可能为空字符串，不拒绝，交给调用方判断
     function trySkeleton(strippedNames) {
         const n = strippedNames.length;
-        if (n < 3) return null;
+        if (n === 0) return null;
 
         const first = strippedNames[0];
-        const firstLen = first.length;
-        let lcpLen = firstLen;
-        let lcsLen = firstLen;
+        let lcpLen = first.length;
+        let lcsLen = first.length;
 
         for (let i = 1; i < n; i++) {
             const b = strippedNames[i];
-            const bLen = b.length;
-
             let p = 0;
-            const maxP = Math.min(lcpLen, bLen);
+            const maxP = Math.min(lcpLen, b.length);
             while (p < maxP && first[p] === b[p]) p++;
             lcpLen = p;
 
             let s = 0;
-            const maxS = Math.min(lcsLen, bLen);
-            while (s < maxS && first[firstLen - 1 - s] === b[bLen - 1 - s]) s++;
+            const maxS = Math.min(lcsLen, b.length);
+            while (s < maxS && first[first.length - 1 - s] === b[b.length - 1 - s]) s++;
             lcsLen = s;
         }
 
-        if (lcpLen + lcsLen >= firstLen) {
-            return { lcp: '', lcs: '', empty: true };
-        }
-
         const lcp = lcpLen === 0 ? '' : first.slice(0, lcpLen);
-        const lcs = lcsLen === 0 ? '' : first.slice(firstLen - lcsLen);
-        return { lcp, lcs, empty: false };
+        const lcs = lcsLen === 0 ? '' : first.slice(first.length - lcsLen);
+        return { lcp, lcs };
     }
 
     function parsePlaylist(rawLines) {
@@ -1179,12 +1190,19 @@
     }
 
     function extractNumbers(groups) {
-        // ========== 第 1 遍：每组算骨架 ==========
-        const groupData = [];
+        // 辅助：求公共后缀
+        function getCommonSuffix(a, b) {
+            let s = 0;
+            const minLen = Math.min(a.length, b.length);
+            while (s < minLen && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+            return a.slice(a.length - s);
+        }
 
+        // ========== 第 1 遍：每组算骨架（所有组一视同仁） ==========
+        const groupData = [];
         for (let g = 0; g < groups.length; g++) {
             const grp = groups[g];
-            if (grp.count < 3) { groupData.push(null); continue; }
+            if (grp.count === 0) { groupData.push(null); continue; }
 
             const r = trySkeleton(grp.strippedNames);
             if (!r) { groupData.push(null); continue; }
@@ -1192,22 +1210,21 @@
             groupData.push({
                 lcp: r.lcp,
                 lcs: r.lcs,
-                empty: r.empty,
                 segments: grp.segments,
                 source: grp.strippedNames,
+                count: grp.count
             });
         }
 
-        // ========== 第 2 遍：二次 LCP 聚类（只对有实际 lcp 的组） ==========
+        // ========== 第 2 遍：二次聚类（解耦 lcs 必须相同的强限制） ==========
         const CLUSTER_THRESHOLD = 0.5;
         const validIndices = [];
         for (let g = 0; g < groupData.length; g++) {
-            const d = groupData[g];
-            if (d && !d.empty && d.lcp !== '') validIndices.push(g);
+            if (groupData[g]) validIndices.push(g);
         }
 
         const parent = new Map();
-        validIndices.forEach(function (g) { parent.set(g, g); });
+        validIndices.forEach(g => parent.set(g, g));
 
         function find(x) {
             while (parent.get(x) !== x) {
@@ -1223,13 +1240,10 @@
 
         for (let i = 0; i < validIndices.length; i++) {
             for (let j = i + 1; j < validIndices.length; j++) {
-                const gi = validIndices[i];
-                const gj = validIndices[j];
-                const di = groupData[gi];
-                const dj = groupData[gj];
+                const gi = validIndices[i], gj = validIndices[j];
+                const di = groupData[gi], dj = groupData[gj];
 
-                if (di.lcs !== dj.lcs) continue;
-
+                // 核心修复：不判断 di.lcs !== dj.lcs，而是判定 lcp 的相似度
                 const p = commonPrefixLen(di.lcp, dj.lcp);
                 if (p === 0) continue;
                 const minLen = Math.min(di.lcp.length, dj.lcp.length);
@@ -1239,62 +1253,85 @@
             }
         }
 
-        const clusterLcp = new Map();
-        validIndices.forEach(function (g) {
+        // 提取聚类中心并收缩特征
+        const clusterMap = new Map();
+        validIndices.forEach(g => {
+            const d = groupData[g];
             const root = find(g);
-            const lcp = groupData[g].lcp;
-            if (!clusterLcp.has(root)) {
-                clusterLcp.set(root, lcp);
-            } else {
-                const existing = clusterLcp.get(root);
-                const p = commonPrefixLen(existing, lcp);
-                clusterLcp.set(root, existing.slice(0, p));
+            if (!clusterMap.has(root)) {
+                clusterMap.set(root, { lcp: d.lcp, lcs: d.lcs, weight: 0 });
             }
+            const c = clusterMap.get(root);
+            c.lcp = c.lcp.slice(0, commonPrefixLen(c.lcp, d.lcp));
+            c.lcs = getCommonSuffix(c.lcs, d.lcs); // lcs 也求交集
+            c.weight += d.source.length;
         });
 
-        validIndices.forEach(function (g) {
-            groupData[g].lcp = clusterLcp.get(find(g));
+        // 将聚类中心收缩后的特征写回给组内所有的原始分组
+        validIndices.forEach(g => {
+            const root = find(g);
+            const c = clusterMap.get(root);
+            groupData[g].lcp = c.lcp;
+            groupData[g].lcs = c.lcs;
+        });
+
+        // 统计每个聚类包含的组数量（用于判断是否为少数派）
+        const rootCount = new Map();
+        validIndices.forEach(g => {
+            const root = find(g);
+            rootCount.set(root, (rootCount.get(root) || 0) + 1);
         });
 
         // ========== 第 3 遍：提取 num + 应用 base ==========
         const baseMap = new Map();
         let numCount = 0;
         const first32Nums = [];
-        const limit = STEP_SAMPLE_COUNT;
+        const limit = PARAMS.STEP_SAMPLE_COUNT;
 
         for (let g = 0; g < groupData.length; g++) {
             const d = groupData[g];
             if (!d) continue;
 
+            const root = find(g);
+            // ★ 核心判定：如果是单元素组，且没有跟其他组聚类成功，那就是少数派，直接返回 null
+            if (d.count === 1 && rootCount.get(root) === 1) {
+                for (let i = 0; i < d.segments.length; i++) d.segments[i].num = null;
+                continue;
+            }
+
+            const lcpLen = d.lcp.length;
+            const lcsLen = d.lcs.length;
             const nums = [];
             let allValid = true;
 
-            if (d.empty) {
-                for (let i = 0; i < d.source.length; i++) nums.push(0);
-            } else {
-                const lcpLen = d.lcp.length;
-                const lcsLen = d.lcs.length;
-                for (let i = 0; i < d.source.length; i++) {
-                    const s = d.source[i];
-                    if (!s.startsWith(d.lcp)) { allValid = false; break; }
-                    if (d.lcs && !s.endsWith(d.lcs)) { allValid = false; break; }
+            for (let i = 0; i < d.source.length; i++) {
+                const s = d.source[i];
+                if (!s.startsWith(d.lcp)) { allValid = false; break; }
+                if (d.lcs && !s.endsWith(d.lcs)) { allValid = false; break; }
+
+                const remainLen = s.length - lcpLen - lcsLen;
+                if (remainLen < 0) {
+                    // 前后缀加起来超过了当前文件名长度，无法提取
+                    allValid = false; break;
+                } else if (remainLen === 0) {
+                    // 刚好覆盖，取 0
+                    nums.push(0);
+                } else {
                     const mid = s.slice(lcpLen, s.length - lcsLen);
                     if (!/^\d+$/.test(mid)) { allValid = false; break; }
                     nums.push(parseInt(mid, 10));
                 }
             }
 
-            if (!allValid) continue;
-
-            let base;
-            if (d.lcp === '' && d.lcs === '') {
-                // 无公共前后缀：组间无交集 → 各自独立 base
-                base = nums[0];
-            } else {
-                const key = 'A\u0001' + d.lcp + '\u0001' + d.lcs;
-                if (!baseMap.has(key)) baseMap.set(key, nums[0]);
-                base = baseMap.get(key);
+            if (!allValid) {
+                for (let i = 0; i < d.segments.length; i++) d.segments[i].num = null;
+                continue;
             }
+
+            // 相同特征共享同一个 base
+            const key = 'A\u0001' + d.lcp + '\u0001' + d.lcs;
+            if (!baseMap.has(key)) baseMap.set(key, nums[0]);
+            const base = baseMap.get(key);
 
             for (let i = 0; i < nums.length; i++) {
                 const adjusted = nums[i] - base;
@@ -1304,7 +1341,7 @@
             }
         }
 
-        return { numCount, first32Nums };
+        return { numCount: numCount, first32Nums: first32Nums };
     }
 
     function computeStep(nums) {
@@ -1588,12 +1625,17 @@
     }
     
     // float33：区间内时长末两位为 33 的片段占比 > 0.5 → 广告区间
-    function strategyFloat33(intervals) {
+    function strategyFloat33(intervals, options) {
         const result = new Set();
+        const minDuration = (options && options.minDuration !== undefined) ? options.minDuration : null;
+        const maxDuration = (options && options.maxDuration !== undefined) ? options.maxDuration : null;
+
         for (let i = 0; i < intervals.length; i++) {
             const it = intervals[i];
             if (it.count === 0) continue;
             if (it.float33Count * 2 <= it.count) continue;
+            if (minDuration !== null && it.totalDuration < minDuration) continue;
+            if (maxDuration !== null && it.totalDuration > maxDuration) continue;
             result.add(it);
         }
         return result;
@@ -1675,7 +1717,7 @@
                 partial = strategyInteger(intervals, rule.options);
                 if (partial.size > 0) rules.add('整数时长');
             } else if (name === 'float33') {
-                partial = strategyFloat33(intervals);
+                partial = strategyFloat33(intervals, rule.options);
                 if (partial.size > 0) rules.add('浮点时长');
             } else continue;
             partial.forEach(function (it) { toDelete.add(it); });
@@ -1969,7 +2011,7 @@
             const ruleText = (result.stats.rules && result.stats.rules.length)
                 ? '规则: ' + result.stats.rules.join('+')
                 : '规则: 广告段';
-            logPush(session, ruleText, result.ads);
+            logPush(session, ruleText, result.ads, result.stats.removedLines);
         }
 
         const rawLines = text.split('\n');

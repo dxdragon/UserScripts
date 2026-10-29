@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.5.5
+// @version           1.6.0
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -363,14 +363,19 @@
     const WATCHDOG_INTERVAL_MS = 500;
     const WATCHDOG_FAIL_THRESHOLD = 5;
     const WATCHDOG_PAUSE_MS = 30000;
-    const STEP_SAMPLE_COUNT = 32;
-    const NUMERIC_MAX_STEP = 10;
 
     const SHORT_MAX_COUNT = 5;
     const SHORT_MODE_THRESHOLD = 5;
     const SHORT_FREQ_MAX = 5;
     const PROTECT_FREQ = 5;
     const PROTECT_RATIO = 0.2;
+
+    // ---- 数字异常 ----
+    const MAX_REMOVE_RATIO = 0.5;            // 熔断阈值：删除分片超过此比例 → 放弃过滤
+    const MIN_COALITION_RATIO = 0.5;         // 联盟时长占比 < 此值 → 不可信，回落 FEATURE/SHORT
+    const RADIX_EARLY_EXIT = 0.6;            // radix10 联盟占比 > 此值 → 跳过 radix16
+    const GAP_MAX = 2;                       // 源站缺号容差（可吸收缺口 = GAP_MAX × step）
+    const KEY_DIM_MAX_DISTINCT = 4;          // 全局取值种类 ≤ 此值的数字维 = 限定符
 
     const currentHost = unsafeWindow.location.hostname;
     const pendingVideoChecks = new Set();
@@ -908,7 +913,7 @@
     // ============================================================
     const AD_PATH_HIGH = [
         'adjump',
-        'adform', 'admaster', 'adsage', 'adwords',
+        'adform', 'admaster', 'adsage', 'adwords', 'admedia',
         'atm.youku', 'cupid.iqiyi', 'gtimg.com/qqlive',
         'smartclip', 'samsungads', 'lgsmartad',
         'p1ayer', 'ssai', 'promo', 'sponsor', 'commercial'
@@ -967,43 +972,20 @@
         return null;
     }
 
-    function commonPrefixLen(a, b) {
-        let p = 0;
-        const minLen = Math.min(a.length, b.length);
-        while (p < minLen && a[p] === b[p]) p++;
-        return p;
-    }
-
-    function trySkeleton(strippedNames) {
-        const n = strippedNames.length;
-        if (n === 0) return null;
-
-        const first = strippedNames[0];
-        let lcpLen = first.length;
-        let lcsLen = first.length;
-
-        for (let i = 1; i < n; i++) {
-            const b = strippedNames[i];
-            let p = 0;
-            const maxP = Math.min(lcpLen, b.length);
-            while (p < maxP && first[p] === b[p]) p++;
-            lcpLen = p;
-
-            let s = 0;
-            const maxS = Math.min(lcsLen, b.length);
-            while (s < maxS && first[first.length - 1 - s] === b[b.length - 1 - s]) s++;
-            lcsLen = s;
+    function isStructuralLine(l) {
+        if (typeof l !== 'string') return false;
+        if (l.indexOf('#EXT-X-KEY') === 0) {
+            // #EXT-X-KEY:METHOD=NONE 是广告标签，不是结构性声明，不上浮
+            return !matchAdTag(l);
         }
-
-        const lcp = lcpLen === 0 ? '' : first.slice(0, lcpLen);
-        const lcs = lcsLen === 0 ? '' : first.slice(first.length - lcsLen);
-        return { lcp, lcs };
+        if (l.indexOf('#EXT-X-MAP') === 0) return true;
+        return false;
     }
 
     function parsePlaylist(rawLines) {
         const lines = [];
         for (let i = 0; i < rawLines.length; i++) {
-            const line = rawLines[i];
+            const line = rawLines[i].trim();
             if (!line) continue;
             if (line.startsWith('#') && !line.startsWith('#EXT')) continue;
 
@@ -1189,184 +1171,6 @@
         };
     }
 
-    function extractNumbers(groups) {
-        // 辅助：求公共后缀
-        function getCommonSuffix(a, b) {
-            let s = 0;
-            const minLen = Math.min(a.length, b.length);
-            while (s < minLen && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
-            return a.slice(a.length - s);
-        }
-
-        // ========== 第 1 遍：每组算骨架（所有组一视同仁） ==========
-        const groupData = [];
-        for (let g = 0; g < groups.length; g++) {
-            const grp = groups[g];
-            if (grp.count === 0) { groupData.push(null); continue; }
-
-            const r = trySkeleton(grp.strippedNames);
-            if (!r) { groupData.push(null); continue; }
-
-            groupData.push({
-                lcp: r.lcp,
-                lcs: r.lcs,
-                segments: grp.segments,
-                source: grp.strippedNames,
-                count: grp.count
-            });
-        }
-
-        // ========== 第 2 遍：二次聚类（解耦 lcs 必须相同的强限制） ==========
-        const CLUSTER_THRESHOLD = 0.5;
-        const validIndices = [];
-        for (let g = 0; g < groupData.length; g++) {
-            if (groupData[g]) validIndices.push(g);
-        }
-
-        const parent = new Map();
-        validIndices.forEach(g => parent.set(g, g));
-
-        function find(x) {
-            while (parent.get(x) !== x) {
-                parent.set(x, parent.get(parent.get(x)));
-                x = parent.get(x);
-            }
-            return x;
-        }
-        function union(a, b) {
-            const ra = find(a), rb = find(b);
-            if (ra !== rb) parent.set(ra, rb);
-        }
-
-        for (let i = 0; i < validIndices.length; i++) {
-            for (let j = i + 1; j < validIndices.length; j++) {
-                const gi = validIndices[i], gj = validIndices[j];
-                const di = groupData[gi], dj = groupData[gj];
-
-                // 核心修复：不判断 di.lcs !== dj.lcs，而是判定 lcp 的相似度
-                const p = commonPrefixLen(di.lcp, dj.lcp);
-                if (p === 0) continue;
-                const minLen = Math.min(di.lcp.length, dj.lcp.length);
-                if (p < minLen * CLUSTER_THRESHOLD) continue;
-
-                union(gi, gj);
-            }
-        }
-
-        // 提取聚类中心并收缩特征
-        const clusterMap = new Map();
-        validIndices.forEach(g => {
-            const d = groupData[g];
-            const root = find(g);
-            if (!clusterMap.has(root)) {
-                clusterMap.set(root, { lcp: d.lcp, lcs: d.lcs, weight: 0 });
-            }
-            const c = clusterMap.get(root);
-            c.lcp = c.lcp.slice(0, commonPrefixLen(c.lcp, d.lcp));
-            c.lcs = getCommonSuffix(c.lcs, d.lcs); // lcs 也求交集
-            c.weight += d.source.length;
-        });
-
-        // 将聚类中心收缩后的特征写回给组内所有的原始分组
-        validIndices.forEach(g => {
-            const root = find(g);
-            const c = clusterMap.get(root);
-            groupData[g].lcp = c.lcp;
-            groupData[g].lcs = c.lcs;
-        });
-
-        // 统计每个聚类包含的组数量（用于判断是否为少数派）
-        const rootCount = new Map();
-        validIndices.forEach(g => {
-            const root = find(g);
-            rootCount.set(root, (rootCount.get(root) || 0) + 1);
-        });
-
-        // ========== 第 3 遍：提取 num + 应用 base ==========
-        const baseMap = new Map();
-        let numCount = 0;
-        const first32Nums = [];
-        const limit = PARAMS.STEP_SAMPLE_COUNT;
-
-        for (let g = 0; g < groupData.length; g++) {
-            const d = groupData[g];
-            if (!d) continue;
-
-            const root = find(g);
-            // ★ 核心判定：如果是单元素组，且没有跟其他组聚类成功，那就是少数派，直接返回 null
-            if (d.count === 1 && rootCount.get(root) === 1) {
-                for (let i = 0; i < d.segments.length; i++) d.segments[i].num = null;
-                continue;
-            }
-
-            const lcpLen = d.lcp.length;
-            const lcsLen = d.lcs.length;
-            const nums = [];
-            let allValid = true;
-
-            for (let i = 0; i < d.source.length; i++) {
-                const s = d.source[i];
-                if (!s.startsWith(d.lcp)) { allValid = false; break; }
-                if (d.lcs && !s.endsWith(d.lcs)) { allValid = false; break; }
-
-                const remainLen = s.length - lcpLen - lcsLen;
-                if (remainLen < 0) {
-                    // 前后缀加起来超过了当前文件名长度，无法提取
-                    allValid = false; break;
-                } else if (remainLen === 0) {
-                    // 刚好覆盖，取 0
-                    nums.push(0);
-                } else {
-                    const mid = s.slice(lcpLen, s.length - lcsLen);
-                    if (!/^\d+$/.test(mid)) { allValid = false; break; }
-                    nums.push(parseInt(mid, 10));
-                }
-            }
-
-            if (!allValid) {
-                for (let i = 0; i < d.segments.length; i++) d.segments[i].num = null;
-                continue;
-            }
-
-            // 相同特征共享同一个 base
-            const key = 'A\u0001' + d.lcp + '\u0001' + d.lcs;
-            if (!baseMap.has(key)) baseMap.set(key, nums[0]);
-            const base = baseMap.get(key);
-
-            for (let i = 0; i < nums.length; i++) {
-                const adjusted = nums[i] - base;
-                d.segments[i].num = adjusted;
-                numCount++;
-                if (first32Nums.length < limit) first32Nums.push(adjusted);
-            }
-        }
-
-        return { numCount: numCount, first32Nums: first32Nums };
-    }
-
-    function computeStep(nums) {
-        const limit = Math.min(nums.length, STEP_SAMPLE_COUNT);
-        if (limit < 2) return 0;
-
-        const diffFreq = new Map();
-        for (let i = 1; i < limit; i++) {
-            const d = nums[i] - nums[i - 1];
-            diffFreq.set(d, (diffFreq.get(d) || 0) + 1);
-        }
-
-        let step = 0;
-        let bestCount = 0;
-        diffFreq.forEach(function (c, d) {
-            if (c > bestCount || (c === bestCount && d > 0)) {
-                bestCount = c;
-                step = d;
-            }
-        });
-
-        if (step <= 0 || step > NUMERIC_MAX_STEP) return 0;
-        return step;
-    }
-
     function analyzePathPrefixes(playlist) {
         const groups = playlist.groups;
         const lengthIndex = playlist.lengthIndex;
@@ -1400,25 +1204,236 @@
         return { hasMinority, hasLengthAnomaly, mainPrefix, mainLen, prefixTotal };
     }
 
-    function detectMode(playlist, numStats) {
-        const pathInfo = analyzePathPrefixes(playlist);
+    // ============================================================
+    // 数字异常
+    //   tokenize → 全局基数分析 → 骨架+限定符分组 → 组内排序切 run → 完美等差联盟
+    // ============================================================
+    function cmpBig(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 
-        if (playlist.hasAdTag && (pathInfo.hasMinority || pathInfo.hasLengthAnomaly)) {
-            return { mode: TS_MODE.FEATURE, pathInfo };
+    function modeBig(arr) {
+        if (arr.length === 0) return null;
+        const freq = new Map();
+        let best = null, bestN = 0;
+        for (let i = 0; i < arr.length; i++) {
+            const k = arr[i].toString();
+            const c = (freq.get(k) || 0) + 1;
+            freq.set(k, c);
+            if (c > bestN) { bestN = c; best = arr[i]; }
+        }
+        return best;
+    }
+    
+    // 剥离同组计数器字符串的公共前缀。
+    // 不变量：真 AP 跨数字宽度边界（…998, 999 → 1000, 1001…）⇒ 首位必从 9 变 1
+    //        ⇒ 全组公共前缀必为空 ⇒ 剥离不生效。
+    function stripCommonPrefix(values, radix) {
+        if (radix !== 10) {
+            return values.map(function (t) { return BigInt('0x' + t); });
         }
 
-        if (numStats.numCount >= 3) {
-            const step = computeStep(numStats.first32Nums);
-            if (step > 0) {
-                return { mode: TS_MODE.NUMERIC, step };
+        let minLen = Infinity;
+        for (let i = 0; i < values.length; i++) {
+            if (values[i].length < minLen) minLen = values[i].length;
+        }
+        let p = 0;
+        const maxP = minLen - 1;                     // 每个值至少保留 1 位
+        while (p < maxP) {
+            const c = values[0][p];
+            let ok = true;
+            for (let i = 1; i < values.length; i++) {
+                if (values[i][p] !== c) { ok = false; break; }
+            }
+            if (!ok) break;
+            p++;
+        }
+        return values.map(function (t) {
+            let body = t.slice(p);
+            body = body.replace(/^0+(?=.)/, '');     // 前导零兼容："00"→"0"
+            if (!body) body = '0';
+            return BigInt(body);
+        });
+    }
+
+    // URI 路径 → { key: 骨架键, nums: BigInt[] }；radix16 把 [0-9a-f]+ 视为一段
+    function tokenizeUri(path, radix) {
+        const re = radix === 16 ? /[0-9a-fA-F]+/g : /[0-9]+/g;
+        const skel = [];
+        const nums = [];
+        let last = 0, m;
+        while ((m = re.exec(path))) {
+            if (m.index > last) skel.push(path.slice(last, m.index));
+            skel.push('\u0001');
+            nums.push(radix === 16 ? BigInt('0x' + m[0]) : BigInt(m[0]));
+            last = m.index + m[0].length;
+        }
+        if (nums.length === 0) return null;
+        skel.push(path.slice(last));
+        return { key: skel.join('') + '#' + nums.length, nums: nums };
+    }
+
+    // 组内选计数器维：取值种类最多者优先，平手看差分众数占比；组内常数维自动落选
+    function pickCounterDim(members) {
+        let bestDim = -1, bestDistinct = 1, bestRatio = -1;
+        const dimCount = members[0].nums.length;
+        for (let d = 0; d < dimCount; d++) {
+            const distinct = new Set();
+            for (let i = 0; i < members.length; i++) distinct.add(members[i].nums[d].toString());
+            if (distinct.size < 2) continue;
+            const sorted = members.slice().sort(function (a, b) { return cmpBig(a.nums[d], b.nums[d]); });
+            const diffs = [];
+            for (let i = 1; i < sorted.length; i++) diffs.push(sorted[i].nums[d] - sorted[i - 1].nums[d]);
+            const md = modeBig(diffs);
+            let ratio = 0;
+            if (md !== null) {
+                let hit = 0;
+                for (let i = 0; i < diffs.length; i++) if (diffs[i] === md) hit++;
+                ratio = hit / diffs.length;
+            }
+            if (distinct.size > bestDistinct || (distinct.size === bestDistinct && ratio > bestRatio)) {
+                bestDim = d; bestDistinct = distinct.size; bestRatio = ratio;
             }
         }
+        return bestDim;
+    }
 
-        if (pathInfo.hasMinority || pathInfo.hasLengthAnomaly) {
-            return { mode: TS_MODE.FEATURE, pathInfo };
+    function analyzeRadix(segments, radix) {
+        /* pass 0: 全量分词 + 收集每个数字维的全局基数（决定谁是限定符） */
+        const toks = new Array(segments.length);
+        const cards = [];
+        for (let i = 0; i < segments.length; i++) {
+            const t = tokenizeUri(segments[i].path, radix);
+            toks[i] = t;
+            if (!t) continue;
+            while (cards.length < t.nums.length) cards.push(new Set());
+            for (let d = 0; d < t.nums.length; d++) cards[d].add(t.nums[d].toString());
+        }
+        const isQualifier = cards.map(function (s) { return s.size <= KEY_DIM_MAX_DISTINCT; });
+
+        /* pass 1: 分组键 = 骨架 + 限定符维取值。
+           日期广告 / 清晰度变体 / CDN 编号从此与主链隔离成组。 */
+        const groups = new Map();
+        for (let i = 0; i < segments.length; i++) {
+            const t = toks[i];
+            if (!t) continue;
+            let key = t.key;
+            for (let d = 0; d < t.nums.length; d++) {
+                if (isQualifier[d]) key += '\u0002' + t.nums[d].toString();
+            }
+            let g = groups.get(key);
+            if (!g) { g = []; groups.set(key, g); }
+            g.push({ seg: segments[i], nums: t.nums, len: t.nums.length });
         }
 
-        return { mode: TS_MODE.SHORT_INTERVAL };
+        /* pass 2: 组内 → 选计数器维 → 剥离公共前缀 → 排序 → 去重 → 众数步长 → 切无缝 run */
+        const runs = [];
+        groups.forEach(function (members) {
+            const dim = pickCounterDim(members);
+            if (dim < 0) return;
+
+            // 把该维字符串值剥掉组内公共前缀后重新解析。
+            const cvs = stripCommonPrefix(
+                members.map(function (m) { return m.nums[dim].toString(radix); }),
+                radix
+            );
+            for (let i = 0; i < members.length; i++) members[i].cv = cvs[i];
+
+            members.sort(function (a, b) { return cmpBig(a.cv, b.cv); });
+            const dedup = [];
+            const seenVal = new Set();
+            for (let i = 0; i < members.length; i++) {
+                const k = members[i].cv.toString();
+                if (seenVal.has(k)) continue;           // 仅同组同值=真重复分片，先出现者占位
+                seenVal.add(k);
+                dedup.push(members[i]);
+            }
+            if (dedup.length < 2) return;
+            const diffs = [];
+            for (let i = 1; i < dedup.length; i++) diffs.push(dedup[i].cv - dedup[i - 1].cv);
+            const step = modeBig(diffs);
+            if (step === null || step <= 0n) return;
+            let start = 0;
+            for (let i = 1; i <= dedup.length; i++) {
+                if (i === dedup.length || dedup[i].cv - dedup[i - 1].cv !== step) {
+                    let dsum = 0;
+                    for (let k = start; k < i; k++) dsum += (dedup[k].seg.duration || 0);
+                    runs.push({ step: step, dim: dim, len: dedup[0].len, dur: dsum, members: dedup.slice(start, i) });
+                    start = i;
+                }
+            }
+        });
+        if (runs.length === 0) return { keep: new Set(), score: 0 };
+
+        /* pass 3: 联盟吸收——按时长降序，增量校验"并集仍是无洞等差数列"才收
+           全程使用 cv（真计数器空间），跨组比较发生在同一空间。 */
+        runs.sort(function (a, b) { return b.dur - a.dur; });
+        const seed = runs[0];
+        const S = seed.step, dim0 = seed.dim, len0 = seed.len;
+        let first = seed.members[0].cv;
+        let last = seed.members[seed.members.length - 1].cv;
+        const seen = new Set();
+        const coalVals = [];
+        const keep = new Set();
+        for (const m of seed.members) {
+            seen.add(m.cv.toString());
+            coalVals.push(m.cv);
+            keep.add(m.seg);
+        }
+        let score = seed.dur;
+
+        function absorb(vals, run) {
+            for (const v of vals) { seen.add(v.toString()); coalVals.push(v); }
+            for (const m of run.members) keep.add(m.seg);
+            score += run.dur;
+        }
+
+        for (let r = 1; r < runs.length; r++) {
+            const run = runs[r];
+            if (run.dim !== dim0 || run.len !== len0) continue;       // 结构不同 → 不并入
+            const vals = run.members.map(function (m) { return m.cv; }).sort(cmpBig);
+            const local = new Set();
+            let ok = true;
+            for (const v of vals) {
+                const k = v.toString();
+                if (seen.has(k) || local.has(k)) { ok = false; break; } // 撞号（隔离后的日期广告组在此被拒）
+                local.add(k);
+                if ((v - first) % S !== 0n) { ok = false; break; }      // 不在网格上
+            }
+            if (!ok) continue;
+            const lo = vals[0], hi = vals[vals.length - 1];
+            const reach = S * BigInt(1 + GAP_MAX);
+            if (hi < first && first - hi <= reach) {
+                absorb(vals, run); first = lo;                          // 向下近邻接：拼回被切断的主链头
+            } else if (lo > last && lo - last <= reach) {
+                absorb(vals, run); last = hi;                           // 向上近邻接：顺延主链尾
+            } else if (lo <= last && hi >= first) {
+                // 区间重叠（多 CDN 交错/乱序）→ 全量重校验并集是否完美等差
+                const union = coalVals.concat(vals).sort(cmpBig);
+                let perfect = union.length >= 2;
+                if (perfect) {
+                    const U = union[1] - union[0];
+                    if (U <= 0n) perfect = false;
+                    for (let i = 2; perfect && i < union.length; i++) {
+                        if (union[i] - union[i - 1] !== U) perfect = false;
+                    }
+                }
+                if (perfect) {
+                    absorb(vals, run);
+                    if (lo < first) first = lo;
+                    if (hi > last) last = hi;
+                }
+            }
+            // 其余（数值断崖/远离网格）→ 广告，拒收
+        }
+        return { keep: keep, score: score };
+    }
+
+    function detectMode(playlist) {
+        const pathInfo = analyzePathPrefixes(playlist);
+        const anomaly = pathInfo.hasMinority || pathInfo.hasLengthAnomaly;
+        if (playlist.hasAdTag && anomaly) {
+            return { mode: TS_MODE.FEATURE, pathInfo, anomaly };
+        }
+        return { mode: TS_MODE.NUMERIC, pathInfo, anomaly };
     }
 
     function filterFeature(playlist, ctx) {
@@ -1497,112 +1512,55 @@
         return Array.from(rules);
     }
 
-    function filterNumeric(playlist, step) {
+    function filterNumeric(playlist) {
         const segments = playlist.segments;
-        const n = segments.length;
+        if (segments.length < 3) return { ok: false, rules: [] };
+        let totalDur = 0;
+        for (let i = 0; i < segments.length; i++) totalDur += (segments[i].duration || 0);
+        if (totalDur <= 0) return { ok: false, rules: [] };
 
-        if (!step || step <= 0 || n < 3) return [];
-
-        let firstIdx = -1;
-        for (let i = 0; i < n; i++) {
-            if (segments[i].num !== null) { firstIdx = i; break; }
+        // radix 自校验：真进制下主链无缝 → 联盟时长最大者胜
+        let best = null;
+        const radices = [10, 16];
+        for (let ri = 0; ri < radices.length; ri++) {
+            const r = analyzeRadix(segments, radices[ri]);
+            if (!best || r.score > best.score) best = r;
+            if (best.score >= totalDur * RADIX_EARLY_EXIT) break;
         }
-        if (firstIdx < 0) return [];
+        if (!best || best.keep.size === 0) return { ok: false, rules: [] };
+        if (best.score < totalDur * MIN_COALITION_RATIO) return { ok: false, rules: [] };
 
-        function hasDisc(seg) {
-            for (let j = 0; j < seg.preLines.length; j++) {
-                if (seg.preLines[j].startsWith('#EXT-X-DISCONTINUITY')) return true;
+        let changed = false;
+        for (let i = 0; i < segments.length; i++) {
+            if (!best.keep.has(segments[i])) {
+                segments[i].removed = true;
+                changed = true;
             }
-            return false;
         }
-
-        let prevNumA = segments[firstIdx].num;
-        let countA = 0;
-        let posB = -1;
-        let prevNumB = 0;
-        let countB = 0;
-        let active = 'A';
-
-        for (let i = firstIdx + 1; i < n; i++) {
-            const seg = segments[i];
-            if (seg.num === null) continue;
-            const cur = seg.num;
-
-            if (active === 'A') {
-                if (cur === prevNumA + step) {
-                    countA++;
-                    prevNumA = cur;
-                } else if (hasDisc(seg)) {
-                    if (posB < 0) {
-                        posB = i;
-                        prevNumB = cur;
-                        countB = 0;
-                    } else if (cur === prevNumB + step) {
-                        countB++;
-                        prevNumB = cur;
+        
+        // 假边界清理：kept 段紧跟 removed 段时，广告留下的 DISCONTINUITY / 广告标签移入 prev.extraAds
+        if (changed) {
+            const segments = playlist.segments;
+            for (let i = 1; i < segments.length; i++) {
+                if (segments[i - 1].removed && !segments[i].removed) {
+                    const prevSeg = segments[i - 1];
+                    const seg = segments[i];
+                    const newPre = [];
+                    for (let j = 0; j < seg.preLines.length; j++) {
+                        const pl = seg.preLines[j];
+                        if (pl.startsWith('#EXT-X-DISCONTINUITY') || matchAdTag(pl)) {
+                            prevSeg.extraAds.push(pl);
+                        } else {
+                            newPre.push(pl);
+                        }
                     }
-                    active = 'B';
-                }
-            } else {
-                if (cur === prevNumB + step) {
-                    countB++;
-                    prevNumB = cur;
-                } else if (hasDisc(seg)) {
-                    if (cur === prevNumA + step) {
-                        countA++;
-                        prevNumA = cur;
-                    }
-                    active = 'A';
+                    seg.preLines = newPre;
                 }
             }
         }
-
-        let pos, firstNum;
-        if (countA >= countB) {
-            pos = firstIdx;
-            firstNum = segments[firstIdx].num;
-        } else {
-            pos = posB;
-            firstNum = segments[posB].num;
-        }
-
-        let prevNum = firstNum;
-        let seenPos = false;
-        let removedAny = false;
-
-        for (let i = 0; i < n; i++) {
-            const seg = segments[i];
-
-            if (i < pos) { 
-                seg.removed = true; 
-                removedAny = true; 
-            } else if (!seenPos) { 
-                seenPos = true; 
-                prevNum = firstNum; 
-            } else if (seg.num !== null && seg.num === prevNum + step) {
-                prevNum = seg.num;
-            } else {
-                seg.removed = true;
-                removedAny = true;
-            }
-
-            // 顺手清理边界
-            if (!seg.removed && i > 0 && segments[i - 1].removed) {
-                const prevSeg = segments[i - 1];
-                const newPre = [];
-                for (let j = 0; j < seg.preLines.length; j++) {
-                    const pl = seg.preLines[j];
-                    if (pl.startsWith('#EXT-X-DISCONTINUITY') || matchAdTag(pl)) {
-                        prevSeg.extraAds.push(pl);
-                    } else {
-                        newPre.push(pl);
-                    }
-                }
-                seg.preLines = newPre;
-            }
-        }
-
-        return removedAny ? ['数字异常'] : [];
+        
+        
+        return { ok: true, rules: changed ? ['数字异常'] : [] };
     }
 
     function strategyInteger(intervals, options) {
@@ -1774,15 +1732,39 @@
         const ads = [];
         let removedCount = 0;
 
+        // 广告在开头时，全局 KEY/MAP 声明在被删分片的 preLines 里，会随广告进 ads
+        // 导致整流无法解密。仅当保留分片都不含 KEY/MAP（单一全局声明）时抢救上浮；
+        // 保留段自带 KEY/MAP（轮换流）则不动，避免错位。
+        const hoistSet = new Set();
+        let structuralInKept = 0;
+        for (let i = 0; i < playlist.segments.length; i++) {
+            if (playlist.segments[i].removed) continue;
+            const pre = playlist.segments[i].preLines;
+            for (let j = 0; j < pre.length; j++) {
+                if (isStructuralLine(pre[j])) structuralInKept++;
+            }
+        }
+        if (structuralInKept === 0) {
+            for (let i = 0; i < playlist.segments.length; i++) {
+                if (!playlist.segments[i].removed) continue;
+                const pre = playlist.segments[i].preLines;
+                for (let j = 0; j < pre.length; j++) {
+                    if (isStructuralLine(pre[j])) hoistSet.add(pre[j]);
+                }
+            }
+        }
+
         for (let i = 0; i < playlist.header.length; i++) {
             out.push(playlist.header[i]);
         }
+        hoistSet.forEach(function (pl) { out.push(pl); });
 
         for (let i = 0; i < playlist.segments.length; i++) {
             const seg = playlist.segments[i];
 
             if (seg.removed) {
                 for (let j = 0; j < seg.preLines.length; j++) {
+                    if (hoistSet.has(seg.preLines[j])) continue;
                     ads.push(seg.preLines[j]);
                     removedCount++;
                 }
@@ -1917,11 +1899,7 @@
             };
         }
 
-        let numStats = { numCount: 0, first32Nums: [] };
-        try { numStats = extractNumbers(playlist.groups); }
-        catch (e) { /* 不致命 */ }
-
-        const ctx = detectMode(playlist, numStats);
+        const ctx = detectMode(playlist);
         stats.mode = ctx.mode;
         stats.modeName = TS_MODE_NAME[ctx.mode] || TS_MODE_NAME[TS_MODE.NONE];
 
@@ -1931,9 +1909,27 @@
                 case TS_MODE.FEATURE:
                     rules = filterFeature(playlist, ctx);
                     break;
-                case TS_MODE.NUMERIC:
-                    rules = filterNumeric(playlist, ctx.step);
+                case TS_MODE.NUMERIC: {
+                    const nr = filterNumeric(playlist);
+                    if (nr.ok) {
+                        // 数字异常成功：即使零删除也不回落，否则干净列表会被 SHORT 误伤
+                        rules = nr.rules;
+                    } else if (ctx.anomaly) {
+                        // 数字模式失败 → 回落到 FEATURE，同步更新模式
+                        stats.mode = MODE.FEATURE;
+                        stats.modeName = MODE_NAME[MODE.FEATURE];
+                        rules = filterFeature(playlist, { pathInfo: ctx.pathInfo });
+                    } else {
+                        // 数字模式失败 → 回落到 SHORT，同步更新模式
+                        stats.mode = MODE.SHORT_INTERVAL;
+                        stats.modeName = MODE_NAME[MODE.SHORT_INTERVAL];
+                        let host = '';
+                        try { host = new URL(url).hostname; } catch (e) {}
+                        stats.ruleName = matchDomainRule(host).name;
+                        rules = filterShortInterval(playlist, host);
+                    }
                     break;
+                }
                 case TS_MODE.SHORT_INTERVAL: {
                     let host = '';
                     try { host = new URL(url).hostname; } catch (e) {}
@@ -1950,6 +1946,17 @@
         }
 
         stats.rules = rules || [];
+
+        // 熔断：删除分片过半 → 判定失误，放弃本次过滤（宁可不删，不可错杀黑屏）
+        let removedSegs = 0;
+        for (let i = 0; i < playlist.segments.length; i++) {
+            if (playlist.segments[i].removed) removedSegs++;
+        }
+        if (removedSegs > playlist.segments.length * MAX_REMOVE_RATIO) {
+            const headLines = playlist.header.slice();
+            if (headLines.length === 0 || headLines[0] !== '#EXTM3U') headLines.unshift('#EXTM3U');
+            return { modified: text, changed: false, stats, headLines, ads: [] };
+        }
 
         const ser = serialize(playlist);
         stats.removedLines = ser.removedCount;

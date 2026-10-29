@@ -228,7 +228,7 @@
       overflow: visible !important;
       position: static !important;
     }
-    body.ac-two-col.google #rso > *:not(.MjjYud.ac-card) { display: none !important; }
+    body.ac-two-col.google #rso > *:not(.MjjYud) { display: none !important; }
     body.ac-two-col.google #rso > .ac-card { ${MASONRY_CARD_CSS} }
     body.ac-two-col.google #botstuff > [data-hveid] > :not([role="navigation"]) { display: none !important; }
 

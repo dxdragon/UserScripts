@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name              M3U8 AD Cleaner
 // @namespace         https://github.com/dxdragon/UserScripts
-// @version           1.6.0
+// @version           1.6.1
 // @description       拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author            Shay
 // @match             *://*/*
@@ -344,8 +344,8 @@
     // ============================================================
     // 2. 常量
     // ============================================================
-    const TS_MODE = { NUMERIC: 0, FEATURE: 1, SHORT_INTERVAL: 2, NONE: 3 };
-    const TS_MODE_NAME = { 0: '数字异常', 1: '特征识别', 2: '短区间', 3: '无' };
+    const MODE = { NUMERIC: 0, FEATURE: 1, SHORT_INTERVAL: 2, NONE: 3 };
+    const MODE_NAME = { 0: '数字异常', 1: '特征识别', 2: '短区间', 3: '无' };
 
     const LOG_MAX = 400;
     const MAX_M3U8_LINES = 50000;
@@ -389,8 +389,10 @@
     // ============================================================
     const DOMAIN_RULES = [
         {
-            name: 'ruyi',
-            test: /^(?:[-\w]+\.)*ryplay\d*\.com$/i,
+            name: 'integer',
+            tests: [
+                /^(?:[-\w]+\.)*ryi?play\d*\.com$/i,
+            ],
             strategies: ['short', 'integer'],
             options: {
                 integerRatioNum: 1,
@@ -400,17 +402,34 @@
             },
         },
         {
-            name: 'xigua',
-            test: /^(?:[-\w]+\.)*(?:jimxtc|xgplay\d*)\.com$/i,
-            strategies: ['short', 'float33'],
+            name: 'float33',
+            tests: [
+                /^(?:[-\w]+\.)*(?:jimxtc|xgplay\d*)\.com$/i,
+                /^(?:[-\w]+\.)*dytt-?\w+\.com$/i,
+                /^(?:[-\w]+\.)*phimgood\.com$/i,
+            ],
+            strategies: ['short', 'float'],
+            float: 33,
             options: {
                 minDuration: 9,
-                maxDuration: 11,
+                maxDuration: 23,
+            },
+        },
+        {
+            name: 'float67',
+            tests: [
+                /^(?:[-\w]+\.)*(?:ffzy|feifei)-\w+\.com$/i,
+            ],
+            strategies: ['short', 'float'],
+            float: 67,
+            options: {
+                minDuration: 9,
+                maxDuration: 23,
             },
         },
         {
             name: 'default',
-            test: /.*/,
+            tests: [/.*/],
             strategies: ['short'],
             options: {},
         },
@@ -419,7 +438,10 @@
     function matchDomainRule(host) {
         const h = host || '';
         for (let i = 0; i < DOMAIN_RULES.length; i++) {
-            if (DOMAIN_RULES[i].test.test(h)) return DOMAIN_RULES[i];
+            const tests = DOMAIN_RULES[i].tests;
+            for (let j = 0; j < tests.length; j++) {
+                if (tests[j].test(h)) return DOMAIN_RULES[i];
+            }
         }
         return DOMAIN_RULES[DOMAIN_RULES.length - 1];
     }
@@ -752,11 +774,14 @@
         return isNaN(v) ? null : v;
     }
 
-    const FLOAT33_REGEX = /^\d+\.\d3{2,}$/;
+    const FLOAT_PATTERNS = {
+        33: /^\d+\.\d?3{2,}$/,     // 末尾至少两个 3
+        67: /^\d+\.\d?6{1,}7$/,    // 6 循环至少一次后接 7
+    };
 
-    function isFloat33Duration(duration) {
+    function isFloatDuration(duration, pattern) {
         if (duration === null || duration === undefined) return false;
-        return FLOAT33_REGEX.test(String(duration));
+        return pattern.test(String(duration));
     }
 
     function cleanUri(uri) {
@@ -1041,7 +1066,7 @@
                 segments: [],
                 count: 0,
                 integerCount: 0,
-                float33Count: 0,
+                floatCounts: new Map(),
                 totalDuration: 0,
                 totalLength: 0,
                 prefixCount: new Map(),
@@ -1086,7 +1111,6 @@
                 const prefix = extractPathPrefix(mediaLine);
                 const len = mediaLine.length;
                 const isIntDur = duration !== null && Number.isInteger(duration);
-                const isFloat33 = isFloat33Duration(duration);
 
                 const lastSlash = path.lastIndexOf('/');
                 const name = lastSlash < 0 ? path : path.slice(lastSlash + 1);
@@ -1110,7 +1134,13 @@
                 curGroup.segments.push(seg);
                 curGroup.count++;
                 if (isIntDur) curGroup.integerCount++;
-                if (isFloat33) curGroup.float33Count++;
+                if (duration !== null) {
+                    for (const fk in FLOAT_PATTERNS) {
+                        if (isFloatDuration(duration, FLOAT_PATTERNS[fk])) {
+                            curGroup.floatCounts.set(fk, (curGroup.floatCounts.get(fk) || 0) + 1);
+                        }
+                    }
+                }
                 if (duration !== null) curGroup.totalDuration += duration;
                 curGroup.totalLength += len;
                 curGroup.prefixCount.set(prefix, (curGroup.prefixCount.get(prefix) || 0) + 1);
@@ -1431,9 +1461,9 @@
         const pathInfo = analyzePathPrefixes(playlist);
         const anomaly = pathInfo.hasMinority || pathInfo.hasLengthAnomaly;
         if (playlist.hasAdTag && anomaly) {
-            return { mode: TS_MODE.FEATURE, pathInfo, anomaly };
+            return { mode: MODE.FEATURE, pathInfo, anomaly };
         }
-        return { mode: TS_MODE.NUMERIC, pathInfo, anomaly };
+        return { mode: MODE.NUMERIC, pathInfo, anomaly };
     }
 
     function filterFeature(playlist, ctx) {
@@ -1582,16 +1612,30 @@
         return result;
     }
     
-    // float33：区间内时长末两位为 33 的片段占比 > 0.5 → 广告区间
-    function strategyFloat33(intervals, options) {
+    // float：区间内命中任一指定 float 特征的片段占比 > 0.5 → 广告区间
+    // floatKeys 取 DOMAIN_RULES.float，可以是单个 key 或 key 数组。
+    function strategyFloat(intervals, options, floatKeys) {
         const result = new Set();
+        const keys = Array.isArray(floatKeys) ? floatKeys : [floatKeys];
+        const valid = [];
+        for (let i = 0; i < keys.length; i++) {
+            const k = String(keys[i]);
+            if (FLOAT_PATTERNS[k]) valid.push(k);
+        }
+        if (valid.length === 0) return result;
+
         const minDuration = (options && options.minDuration !== undefined) ? options.minDuration : null;
         const maxDuration = (options && options.maxDuration !== undefined) ? options.maxDuration : null;
 
         for (let i = 0; i < intervals.length; i++) {
             const it = intervals[i];
             if (it.count === 0) continue;
-            if (it.float33Count * 2 <= it.count) continue;
+            let hit = false;
+            for (let k = 0; k < valid.length; k++) {
+                const fc = it.floatCounts ? (it.floatCounts.get(valid[k]) || 0) : 0;
+                if (fc * 2 > it.count) { hit = true; break; }
+            }
+            if (!hit) continue;
             if (minDuration !== null && it.totalDuration < minDuration) continue;
             if (maxDuration !== null && it.totalDuration > maxDuration) continue;
             result.add(it);
@@ -1657,7 +1701,7 @@
                 group: grp,
                 count: grp.count,
                 integerCount: grp.integerCount,
-                float33Count: grp.float33Count,
+                floatCounts: grp.floatCounts,
                 totalDuration: grp.totalDuration,
             };
         });
@@ -1674,8 +1718,8 @@
             } else if (name === 'integer') {
                 partial = strategyInteger(intervals, rule.options);
                 if (partial.size > 0) rules.add('整数时长');
-            } else if (name === 'float33') {
-                partial = strategyFloat33(intervals, rule.options);
+            } else if (name === 'float') {
+                partial = strategyFloat(intervals, rule.options, rule.float);
                 if (partial.size > 0) rules.add('浮点时长');
             } else continue;
             partial.forEach(function (it) { toDelete.add(it); });
@@ -1801,8 +1845,8 @@
         const stats = {
             originalLines: 0,
             removedLines: 0,
-            mode: TS_MODE.NONE,
-            modeName: TS_MODE_NAME[TS_MODE.NONE],
+            mode: MODE.NONE,
+            modeName: MODE_NAME[MODE.NONE],
             ruleName: '',
             rules: [],
             error: null,
@@ -1861,8 +1905,8 @@
         }
 
         if (playlist.hasKeyword) {
-            stats.mode = TS_MODE.FEATURE;
-            stats.modeName = TS_MODE_NAME[TS_MODE.FEATURE];
+            stats.mode = MODE.FEATURE;
+            stats.modeName = MODE_NAME[MODE.FEATURE];
             stats.rules = ['关键词'];
 
             // 前置边界清理
@@ -1901,15 +1945,15 @@
 
         const ctx = detectMode(playlist);
         stats.mode = ctx.mode;
-        stats.modeName = TS_MODE_NAME[ctx.mode] || TS_MODE_NAME[TS_MODE.NONE];
+        stats.modeName = MODE_NAME[ctx.mode] || MODE_NAME[MODE.NONE];
 
         let rules;
         try {
             switch (ctx.mode) {
-                case TS_MODE.FEATURE:
+                case MODE.FEATURE:
                     rules = filterFeature(playlist, ctx);
                     break;
-                case TS_MODE.NUMERIC: {
+                case MODE.NUMERIC: {
                     const nr = filterNumeric(playlist);
                     if (nr.ok) {
                         // 数字异常成功：即使零删除也不回落，否则干净列表会被 SHORT 误伤
@@ -1930,7 +1974,7 @@
                     }
                     break;
                 }
-                case TS_MODE.SHORT_INTERVAL: {
+                case MODE.SHORT_INTERVAL: {
                     let host = '';
                     try { host = new URL(url).hostname; } catch (e) {}
                     stats.ruleName = matchDomainRule(host).name;

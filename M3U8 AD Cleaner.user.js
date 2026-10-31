@@ -2122,6 +2122,9 @@
         // ---- 无广告/错误 且（不同源 或 之前是 pending）：替换 ----
         activeSession = newSession;
     }
+    
+    let pendingTimeoutTimer = null;
+    const PENDING_TIMEOUT_MS = 15000;
 
     function notifyM3U8Pending(url) {
         if (unsafeWindow.self !== unsafeWindow.top) {
@@ -2141,6 +2144,24 @@
         updateActiveSession(s);
         refreshHlsMenu();
         updateFilterTip();
+        
+        // 15 秒兜底：如果一直没收到 processed/error，判为超时
+        if (pendingTimeoutTimer) clearTimeout(pendingTimeoutTimer);
+        pendingTimeoutTimer = setTimeout(() => {
+            pendingTimeoutTimer = null;
+            if (!activeSession || activeSession.outcome !== 'pending') return;
+            if (getSourceKey(activeSession.url) !== getSourceKey(url)) return;
+
+            const s2 = createSession(activeSession.url);
+            s2.outcome = 'parse-error';
+            s2.parseError = 'timeout';
+            activeSession = s2;
+            updateFilterTip();
+        }, PENDING_TIMEOUT_MS);
+    }
+    
+    function clearPendingTimeout() {
+        if (pendingTimeoutTimer) { clearTimeout(pendingTimeoutTimer); pendingTimeoutTimer = null; }
     }
 
     function buildStatusToast(session) {
@@ -2217,7 +2238,7 @@
         }, TOAST_DELAY_NO_AD_MS);
     }
 
-    // ★ 新增：网络失败处理（对齐 Firefox filter.onerror）
+    // 网络失败处理
     function onM3U8NetworkError(url) {
         if (unsafeWindow.self !== unsafeWindow.top) {
             try {
@@ -2228,16 +2249,17 @@
             return;
         }
 
-        // 没有历史过滤记录 → 不动（避免首次加载失败清状态）
+        const wasPending = activeSession && activeSession.outcome === 'pending';
         const hasOldAds = activeSession && activeSession.adLines && activeSession.adLines.length > 0;
-        if (!hasOldAds) return;
+
+        // 没有历史广告记录且不是 pending → 不动
+        if (!hasOldAds && !wasPending) return;
 
         const failedSourceKey = getSourceKey(url);
 
-        // 同源失败 → 不动（音轨失败不影响主视频状态）
-        if (failedSourceKey === activeSession.sourceKey) return;
+        // 同源且有旧广告 → 保持（音轨失败不影响主视频）；但 pending 必须清
+        if (!wasPending && failedSourceKey === activeSession.sourceKey) return;
 
-        // 不同源失败 → 视为换线路 → 替换（清 badge）
         const s = createSession(url);
         s.outcome = 'parse-error';
         s.parseError = 'network-error';
@@ -2271,7 +2293,8 @@
 
             const key = url || '';
             const now = Date.now();
-            if (key && key === lastProcessedUrl && now - lastProcessedTime < STATUS_DEDUP_WINDOW_MS) return;
+            const wasPending = activeSession && activeSession.outcome === 'pending';
+            if (key && key === lastProcessedUrl && now - lastProcessedTime < STATUS_DEDUP_WINDOW_MS && !wasPending) return;
             lastProcessedUrl = key;
             lastProcessedTime = now;
 
@@ -2349,6 +2372,8 @@
             apply(target, thisArg, args) {
                 const xhr = thisArg;
                 const reqUrl = URL_MAP.get(xhr) || '';
+                
+                RESP_CACHE.delete(xhr);   // 清掉上一次 send 的缓存
 
                 if (!looksLikeM3U8(reqUrl)) {
                     return Reflect.apply(target, thisArg, args);
@@ -2356,7 +2381,7 @@
 
                 notifyM3U8Pending(reqUrl);
 
-                // ★ 网络失败监听（error / timeout），只触发一次
+                // 网络失败监听（error / timeout），只触发一次
                 try {
                     let networkErrNotified = false;
                     const onNetworkErr = function () {
@@ -2497,6 +2522,7 @@
                         });
                     }).catch(function (e) {
                         logError('hookFetch 处理失败:', e);
+                            onM3U8NetworkError(url);   // 视为请求失败，走错误处理
                         return response;
                     });
                 }).catch(function (e) {

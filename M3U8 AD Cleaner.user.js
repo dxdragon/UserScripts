@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         M3U8 AD Cleaner
 // @namespace    https://github.com/dxdragon/UserScripts
-// @version      1.6.2
+// @version      1.6.3
 // @description  拦截和过滤 m3u8 切片广告，支持导出无广告播放列表
 // @author       Shay
 // @match        *://*/*
@@ -373,40 +373,46 @@
   // 3. m3u8 域名规则池
   // ============================================================
   const DOMAIN_RULES = [
-    {
-      name: 'integer',
-      tests: [
-        /^(?:[-\w]+\.)*ryi?play\d*\.com$/i,
-      ],
-      strategies: ['short', 'integer'],
-      options: { integerRatioNum: 1, integerRatioDen: 3, minDuration: 19, maxDuration: 23 },
-    },
-    {
-      name: 'float33',
-      tests: [
-        /^(?:[-\w]+\.)*(?:jimxtc|xgplay\d*)\.com$/i,
-        /^(?:[-\w]+\.)*dytt-?\w+\.com$/i,
-        /^(?:[-\w]+\.)*phimgood\.com$/i,
-      ],
-      strategies: ['short', 'float'],
-      float: 33,
-      options: { minDuration: 0, maxDuration: 23 },
-    },
-    {
-      name: 'float67',
-      tests: [
-        /^(?:[-\w]+\.)*(?:ffzy|feifei)-\w+\.com$/i,
-      ],
-      strategies: ['short', 'float'],
-      float: 67,
-      options: { minDuration: 0, maxDuration: 23 },
-    },
-    {
-      name: 'default',
-      tests: [/.*/],
-      strategies: ['short'],
-      options: {},
-    },
+      {
+          name: '如意',
+          tests: [/^(?:[-\w]+\.)*ryi?play\d*\.com$/i],
+          strategies: ['short', 'integer'],
+          options: {integerRatioNum: 1, integerRatioDen: 3, minDuration: 19, maxDuration: 23}
+      },
+      {
+          name: '西瓜',
+          tests: [/^(?:[-\w]+\.)*(?:jimxtc|xgplay\d*)\.com$/i],
+          strategies: ['short', 'float'],
+          float: 33,
+          options: {floatRatioNum: 1, floatRatioDen: 3, minDuration: 0, maxDuration: 23}
+      },
+      {
+          name: '天堂',
+          tests: [/^(?:[-\w]+\.)*dytt-?\w+\.com$/i],
+          strategies: ['short', 'float'],
+          float: 33,
+          options: {floatRatioNum: 1, floatRatioDen: 3, minDuration: 0, maxDuration: 23}
+      },
+      {
+          name: '非凡',
+          tests: [/^(?:[-\w]+\.)*(?:ffzy|feifei)-\w+\.com$/i],
+          strategies: ['short', 'float'],
+          float: 67,
+          options: {floatRatioNum: 1, floatRatioDen: 3, minDuration: 0, maxDuration: 23}
+      },
+      {
+          name: '无水印',
+          tests: [/^(?:[-\w]+\.)*wsyzym3u8\.com$/i],
+          strategies: ['float'],
+          float: [33, 67],
+          options: {floatRatioNum: 1, floatRatioDen: 3, minDuration: 0, maxDuration: 23}
+      },
+      {
+          name: 'default',
+          tests: [/.*/],
+          strategies: ['short'],
+          options: {}
+      },
   ];
 
   function matchDomainRule(host) {
@@ -973,7 +979,7 @@
   // 8. 核心过滤算法
   // ============================================================
   const AD_PATH_HIGH = [
-    'adjump', 'adform', 'admaster', 'adsage', 'adwords', 'admedia',
+    'adjump', 'admedia', 'adform', 'admaster', 'adsage', 'adwords',
     'atm.youku', 'cupid.iqiyi', 'gtimg.com/qqlive', 'smartclip',
     'samsungads', 'lgsmartad', 'p1ayer', 'ssai', 'promo', 'sponsor', 'commercial'
   ];
@@ -1058,7 +1064,8 @@
     if (firstExtinf === -1) {
       return {
         header: lines, segments: [], groups: [], lengthIndex: new Map(),
-        hasAdTag: false, hasKeyword: false, empty: true, tail: [],
+        hasAdTag: false, hasKeyword: false, keywordRemovedCount: 0,
+        empty: true, tail: [],
       };
     }
 
@@ -1071,6 +1078,7 @@
     let groupId = 0;
     let hasAdTag = false;
     let hasKeyword = false;
+    let keywordRemovedCount = 0;    // 关键词熔断计数，防止不规范的网站正常片段全是关键词（主要是host）
     let curGroup = null;
 
     for (let i = 0; i < firstExtinf; i++) {
@@ -1153,6 +1161,7 @@
         if (matchAdPath(mediaLine)) {
           hasKeyword = true;
           seg.removed = true;
+          keywordRemovedCount++;  // 关键词熔断计数
         }
 
         pendingPreLines = [];
@@ -1191,7 +1200,7 @@
 
     return {
       header, segments, groups, lengthIndex,
-      hasAdTag, hasKeyword, empty: false, tail,
+      hasAdTag, hasKeyword, keywordRemovedCount, empty: false, tail,
     };
   }
 
@@ -1609,18 +1618,21 @@
     const maxDuration = (options && options.maxDuration !== undefined) ? options.maxDuration : null;
 
     for (let i = 0; i < intervals.length; i++) {
-      const it = intervals[i];
-      if (it.count === 0) continue;
-      if (it.integerCount * integerRatioDen < it.count * integerRatioNum) continue;
-      if (!Number.isInteger(it.totalDuration)) continue;
-      if (minDuration !== null && it.totalDuration < minDuration) continue;
-      if (maxDuration !== null && it.totalDuration > maxDuration) continue;
-      result.add(it);
+        const it = intervals[i];
+        if (it.count === 0) continue;
+
+        // 整数时长占比 >= num/den 才命中
+        const ratioHit = it.integerCount * ratioDen >= it.count * ratioNum;
+        if (!ratioHit) continue;
+
+        if (!Number.isInteger(it.totalDuration)) continue;
+        if (minDuration !== null && it.totalDuration <= minDuration) continue;
+        if (maxDuration !== null && it.totalDuration >= maxDuration) continue;
+        result.add(it);
     }
     return result;
   }
 
-  // float：区间内命中任一指定 float 特征的片段占比 > 0.5 → 广告区间
   // floatKeys 取 DOMAIN_RULES.float，可以是单个 key 或 key 数组。
   function strategyFloat(intervals, options, floatKeys) {
     const result = new Set();
@@ -1631,21 +1643,25 @@
       if (FLOAT_PATTERNS[k]) valid.push(k);
     }
     if (valid.length === 0) return result;
+    
+    // 比例可配置：fc / count > num / den  ⇔  fc * den > count * num
+    const ratioNum = (options && options.floatRatioNum !== undefined) ? options.floatRatioNum : 1;
+    const ratioDen = (options && options.floatRatioDen !== undefined) ? options.floatRatioDen : 2;
     const minDuration = (options && options.minDuration !== undefined) ? options.minDuration : null;
     const maxDuration = (options && options.maxDuration !== undefined) ? options.maxDuration : null;
 
     for (let i = 0; i < intervals.length; i++) {
-      const it = intervals[i];
-      if (it.count === 0) continue;
-      let hit = false;
-      for (let k = 0; k < valid.length; k++) {
-        const fc = it.floatCounts ? (it.floatCounts.get(valid[k]) || 0) : 0;
-        if (fc * 2 > it.count) { hit = true; break; }
-      }
-      if (!hit) continue;
-      if (minDuration !== null && it.totalDuration < minDuration) continue;
-      if (maxDuration !== null && it.totalDuration > maxDuration) continue;
-      result.add(it);
+        const it = intervals[i];
+        if (it.count === 0) continue;
+        let hit = false;
+        for (let k = 0; k < valid.length; k++) {
+            const fc = it.floatCounts ? (it.floatCounts.get(valid[k]) || 0) : 0;
+            if (fc * ratioDen >= it.count * ratioNum) { hit = true; break; }
+        }
+        if (!hit) continue;
+        if (minDuration !== null && it.totalDuration <= minDuration) continue;
+        if (maxDuration !== null && it.totalDuration >= maxDuration) continue;
+        result.add(it);
     }
     return result;
   }
@@ -1910,6 +1926,13 @@
       stats.modeName = MODE_NAME[MODE.FEATURE];
       stats.rules = ['关键词'];
 
+      // 熔断：关键词命中也可能是 host 级误判，删除过半则放弃，熔断关键词已在解析时统计过
+      if (playlist.keywordRemovedCount > playlist.segments.length * PARAMS.MAX_REMOVE_RATIO) {
+        const headLines = playlist.header.slice();
+        if (headLines.length === 0 || headLines[0] !== '#EXTM3U') headLines.unshift('#EXTM3U');
+        return { modified: text, changed: false, stats: stats, headLines: headLines, ads: [] };
+      }
+
       // 前置边界清理
       const segs = playlist.segments;
       for (let i = 1; i < segs.length; i++) {
@@ -1987,18 +2010,6 @@
     }
 
     stats.rules = rules || [];
-
-    // 熔断：删除分片过半 → 判定失误，放弃本次过滤（宁可不删，不可错杀黑屏）
-    let removedSegs = 0;
-    for (let i = 0; i < playlist.segments.length; i++) {
-      if (playlist.segments[i].removed) removedSegs++;
-    }
-    if (removedSegs > playlist.segments.length * MAX_REMOVE_RATIO) {
-      const headLines = playlist.header.slice();
-      if (headLines.length === 0 || headLines[0] !== '#EXTM3U') headLines.unshift('#EXTM3U');
-      return { modified: text, changed: false, stats, headLines, ads: [] };
-    }
-
     const ser = serialize(playlist);
     stats.removedLines = ser.removedCount;
     const headLines = playlist.header.slice();

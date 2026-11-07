@@ -1612,8 +1612,8 @@
 
   function strategyInteger(intervals, options) {
     const result = new Set();
-    const integerRatioNum = (options && options.integerRatioNum) || 1;
-    const integerRatioDen = (options && options.integerRatioDen) || 1;
+    const ratioNum = (options && options.integerRatioNum) || 1;
+    const ratioDen = (options && options.integerRatioDen) || 1;
     const minDuration = (options && options.minDuration !== undefined) ? options.minDuration : null;
     const maxDuration = (options && options.maxDuration !== undefined) ? options.maxDuration : null;
 
